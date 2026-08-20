@@ -316,5 +316,62 @@ class SafetyGateTest(unittest.TestCase):
             E.STATE["daily_loss_limit_hit"] = saved_flags
 
 
+class IntentRegimeWeightTest(unittest.TestCase):
+    """Layer-9 regime weights must be regime-adaptive, not a silent uniform
+    fallback, when MEMORY carries a narrative-scale regime string."""
+
+    def test_narrative_regime_maps_to_adaptive_weights(self):
+        saved = E.MEMORY.get("regime")
+        try:
+            E.MEMORY["regime"] = "TREND"
+            score, status, details = E.InstitutionalIntentEngine.detect(_df(160), None, "BTC/USDT:USDT")
+            self.assertIn("regime_weights", details)
+            self.assertEqual(details["regime"], "TREND")
+            w = details["regime_weights"]
+            self.assertNotEqual(w["liquidity"], 12.5, msg="flat 12.5 fallback should not fire for a known regime")
+            self.assertEqual(w["institutional_flow"], 18)
+            self.assertEqual(details["regime_input"], "TREND")
+        finally:
+            E.MEMORY["regime"] = saved
+
+    def test_unknown_regime_uses_uniform_baseline(self):
+        saved = E.MEMORY.get("regime")
+        try:
+            E.MEMORY["regime"] = "EXPANSION"
+            _, _, details = E.InstitutionalIntentEngine.detect(_df(160), None, "BTC/USDT:USDT")
+            self.assertEqual(details["regime"], "NEUTRAL")
+            self.assertEqual(details["regime_weights"]["liquidity"], 12.5)
+            self.assertEqual(details["regime_input"], "EXPANSION")
+        finally:
+            E.MEMORY["regime"] = saved
+
+
+class QueuePromotionsPayloadTest(unittest.TestCase):
+    """Watchlist→queue promotion count must be visible in the dashboard payload."""
+
+    def test_promotions_counter_present(self):
+        import importlib
+        import sys
+        D = importlib.import_module("dashboard.app")
+        # The route reads the engine MEMORY/CACHE objects live, regardless of
+        # which sys.modules snapshot other tests may have rebound.
+        eng = sys.modules["core.engine"]
+        saved = eng.MEMORY.get("watchlist_queue_promotions")
+        eng.MEMORY["watchlist_queue_promotions"] = 7
+        try:
+            client = D.app.test_client()
+            eng.CACHE.pop("dashboard", None)
+            resp = client.get("/data")
+            self.assertEqual(resp.status_code, 200)
+            body = resp.get_json()
+            self.assertEqual(body["queue"]["promotions"], 7)
+        finally:
+            if saved is None:
+                eng.MEMORY.pop("watchlist_queue_promotions", None)
+            else:
+                eng.MEMORY["watchlist_queue_promotions"] = saved
+            eng.CACHE.pop("dashboard", None)
+
+
 if __name__ == "__main__":
     unittest.main()

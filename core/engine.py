@@ -395,8 +395,12 @@ class InstitutionalIntentEngine:
         score += narrative_score * 0.13
 
         # ----- Layer 9: Dynamic Probability Engine (regime‑adaptive weights) -----
-        regime = MEMORY.get("regime", "RANGE")
-        weights = InstitutionalIntentEngine._get_regime_weights(regime)
+        # Map narrative-scale regimes onto the adaptive scenarios; unknown
+        # values intentionally fall back to the uniform baseline weights.
+        regime_input = MEMORY.get("regime", "RANGE")
+        regime_map = {"CHOP": "RANGE", "RANGE": "RANGE", "TREND": "TREND", "NEWS": "NEWS"}
+        regime_tag = regime_map.get(str(regime_input).upper(), "NEUTRAL")
+        weights = InstitutionalIntentEngine._get_regime_weights(regime_tag)
         final_score = (
             liq_score * weights['liquidity'] +
             absorption_score * weights['absorption'] +
@@ -421,7 +425,8 @@ class InstitutionalIntentEngine:
             status = "NEUTRAL"
 
         details['regime_weights'] = weights
-        details['regime'] = regime
+        details['regime'] = regime_tag
+        details['regime_input'] = regime_input
         return round(final_score, 2), status, details
 
     @staticmethod
@@ -5479,6 +5484,10 @@ def adjust_narrative_confidence(narrative, regime, side, trend_direction):
 
 def evaluate_with_narrative(symbol, side, price, atr_val, df, ob, rf_signal, existing_score=0):
     regime = detect_market_regime(df)
+    # Publish the freshly-classified market regime so the Intent Engine's
+    # layer-9 adaptive weights (and the dashboard) see a live value instead of
+    # the process-start default.
+    MEMORY["regime"] = regime
     trend_dir = get_trend_direction(df)
     narrative = classify_market_narrative(df, ob, atr_val, side, rf_signal)
     final_conf, final_class = adjust_narrative_confidence(narrative, regime, side, trend_dir)

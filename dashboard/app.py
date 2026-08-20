@@ -1038,10 +1038,11 @@ def data():
                 'total': queue_status['total_candidates'],
                 'ready': queue_status['ready'],
                 'best_score': queue_status['best_score'],
+                'promotions': int(MEMORY.get('watchlist_queue_promotions', 0)),
                 'candidates': queue_status['candidates'][:15]
             }
         else:
-            payload['queue'] = {'enabled': False}
+            payload['queue'] = {'enabled': False, 'promotions': 0}
         
         safe_payload = safe_json(payload)
         cache_set("dashboard", safe_payload)

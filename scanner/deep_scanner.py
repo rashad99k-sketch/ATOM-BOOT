@@ -220,6 +220,15 @@ class DeepScanner:
                 vol_ratio = float(df["volume"].iloc[-1] / vol_ma) if vol_ma > 0 else 1.0
                 momentum = E.MomentumFlowEngine.analyze_momentum_flow(df)
                 smart = E.SmartMoneyEngine.analyze_smart_money(df)
+                # Publish the freshly classified market regime so the Intent
+                # Engine's layer-9 adaptive weights consume a live value
+                # (evaluate_with_narrative is not reached by the current
+                # watch-list-driven pipeline).
+                try:
+                    regime = E.detect_market_regime(df)
+                    E.MEMORY["regime"] = regime
+                except Exception:
+                    pass  # regime publishing must never break the scan
                 zones = self._zone_context(sym, df)
 
                 # Lightweight radar score: discovery only. No entry decision here.
