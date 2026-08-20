@@ -1,0 +1,148 @@
+import importlib
+import sys
+import types
+import unittest
+import pandas as pd
+import numpy as np
+
+
+def _install_stubs():
+    # Always install deterministic dependency boundaries. The test must not depend
+    # on which earlier test happened to import core.engine.
+    core_mod = types.ModuleType("core")
+    core_mod.__path__ = []
+    engine = types.ModuleType("core.engine")
+    class FakeExchange:
+        def __init__(self):
+            self.markets = {
+                "BTC/USDT:USDT": {"base": "BTC", "type": "swap", "active": True},
+                "GOLD(XAU)/USDT:USDT": {"base": "GOLD(XAU)", "type": "swap", "active": True},
+                "OILWTI/USDT:USDT": {"base": "OILWTI", "type": "swap", "active": True},
+                "AAPL/USDT:USDT": {"base": "AAPL", "type": "swap", "active": True},
+                "SP500/USDT:USDT": {"base": "SP500", "type": "swap", "active": True},
+            }
+        def load_markets(self):
+            return self.markets
+    engine.ex = FakeExchange()
+    engine.MEMORY = {"watchlist": {}}
+    engine.log_execution = lambda *a, **k: None
+    engine.RFEngine = lambda period=20, multiplier=3.5: types.SimpleNamespace(
+        compute=lambda df: {"triggered": False, "distance": 0.002, "signal": "BUY"}
+    )
+    engine.MomentumFlowEngine = types.SimpleNamespace(analyze_momentum_flow=lambda df: {
+        "trend_expansion": True, "flow_bias": "BUY"
+    })
+    engine.SmartMoneyEngine = types.SimpleNamespace(analyze_smart_money=lambda df: {
+        "smart_money_dominant": True, "institutional_bias": "BUY", "distribution_risk": 10
+    })
+    engine.compute_atr = lambda df: pd.Series(np.full(len(df), 1.0), index=df.index)
+    engine.compute_adx = lambda df: pd.Series(np.full(len(df), 25.0), index=df.index)
+    engine.get_smart_zones = lambda sym, df, ob=None: {
+        "buy_zones": [{"price": float(df.close.iloc[-1]) * 0.999, "strength": 80}],
+        "sell_zones": [{"price": float(df.close.iloc[-1]) * 1.001, "strength": 70}],
+    }
+    engine.get_orderbook_cached = lambda *a, **k: {"bids": [[99, 10]], "asks": [[101, 5]]}
+    engine.get_ohlcv_safe = lambda *a, **k: _df()
+    sys.modules["core"] = core_mod
+    sys.modules["core.engine"] = engine
+
+    news_mod = types.ModuleType("news.service")
+    class FakeNews:
+        def assess(self, *args, **kwargs):
+            return types.SimpleNamespace(
+                bias="NEUTRAL", risk=0, as_dict=lambda: {"available": False, "risk": 0, "bias": "NEUTRAL", "headlines": []}
+            )
+    news_mod.NewsService = FakeNews
+    sys.modules["news.service"] = news_mod
+
+    strategy_mod = types.ModuleType("strategy.engine")
+    class FakeStrategy:
+        def analyze(self, symbol, side, df, orderbook=None):
+            return {
+                "side": side, "price": float(df.close.iloc[-1]), "score": 7.0 if side == "BUY" else 5.0,
+                "narrative": {"sweep": True, "choch_bos": True, "retest": True, "rejection": True, "displacement": True},
+                "narrative_score": 6.0, "intent_score": 70, "intent_status": "ACCUMULATION",
+                "intent_details": {}, "smart_money": {"institutional_bias": side, "distribution_risk": 10, "accumulation_strength": 80},
+                "momentum": {"trend_expansion": True, "momentum_decay": False, "exhaustion_risk": 10, "continuation_strength": 80},
+            }
+    strategy_mod.StrategyEngine = FakeStrategy
+    sys.modules["strategy.engine"] = strategy_mod
+
+
+def _df():
+    n = 80
+    close = np.linspace(100, 120, n)
+    return pd.DataFrame({
+        "open": close - 0.5,
+        "high": close + 1,
+        "low": close - 1,
+        "close": close,
+        "volume": np.full(n, 1000.0),
+    })
+
+
+class DeepScannerRuntimeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._saved = {name: sys.modules.get(name) for name in ("core", "core.engine", "news.service", "strategy.engine", "scanner.deep_scanner")}
+        _install_stubs()
+        # Reload the scanner after dependency stubs are installed so test order
+        # cannot leak a previously imported production module.
+        sys.modules.pop("scanner.deep_scanner", None)
+        importlib.invalidate_caches()
+        module = importlib.import_module("scanner.deep_scanner")
+        cls.DeepScanner = module.DeepScanner
+
+    @classmethod
+    def tearDownClass(cls):
+        for name, module in cls._saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def test_radar_does_not_zero_out_when_radar_symbols_is_unset(self):
+        scanner = self.DeepScanner(max_symbols=5)
+        scanner.radar_symbols = 0  # backwards-compatible "scan all discovered rows"
+        rows = scanner._discover()
+        radar = scanner._radar(rows)
+        self.assertEqual(len(radar), 5)
+        self.assertTrue({r["asset_class"] for r in radar} >= {"CRYPTO", "GOLD", "OIL", "INDEX", "STOCK"})
+
+    def test_zone_keys_are_consistent(self):
+        scanner = self.DeepScanner(max_symbols=1)
+        zones = scanner._zone_context("BTC/USDT:USDT", _df())
+        self.assertIn("buy_zone", zones)
+        self.assertIn("sell_zone", zones)
+        self.assertNotIn("buy_near", zones)
+        self.assertNotIn("sell_near", zones)
+
+    def test_watchlist_seed_is_dynamic(self):
+        scanner = self.DeepScanner(max_symbols=3)
+        scanner.radar_symbols = 0
+        top = scanner.scan(force=True)
+        self.assertEqual(len(top), 3)
+        self.assertEqual(len(sys.modules["core.engine"].MEMORY["watchlist"]), 3)
+
+    def test_provider_failure_does_not_erase_existing_watchlist(self):
+        scanner = self.DeepScanner(max_symbols=3)
+        scanner.radar_symbols = 0
+        scanner.scan(force=True)
+        before = dict(sys.modules["core.engine"].MEMORY["watchlist"])
+        scanner._market_loader = lambda: (_ for _ in ()).throw(TimeoutError("provider timeout"))
+        scanner.scan(force=True)
+        after = sys.modules["core.engine"].MEMORY["watchlist"]
+        self.assertEqual(set(after), set(before))
+        self.assertEqual(scanner.status["universe"], "PROVIDER_FAILURE")
+        self.assertIn(scanner.status["watchlist"], {"PRESERVED_DEGRADED", "UNAVAILABLE"})
+
+    def test_radar_symbols_is_optional_filter(self):
+        scanner = self.DeepScanner(max_symbols=5)
+        scanner.radar_symbols = 0
+        scanner.radar_symbol_override = ["AAPL/USDT:USDT", "SP500/USDT:USDT"]
+        rows = scanner._discover()
+        self.assertEqual({r["symbol"] for r in rows}, {"AAPL/USDT:USDT", "SP500/USDT:USDT"})
+
+
+if __name__ == "__main__":
+    unittest.main()

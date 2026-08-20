@@ -1,0 +1,6 @@
+ccxt
+pandas
+numpy
+Flask
+requests
+python-dotenv

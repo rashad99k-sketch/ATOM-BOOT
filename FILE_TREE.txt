@@ -1,0 +1,20 @@
+RF_Liquidity_Pro/
+├── app/                 # process/bootstrap boundary
+├── config/              # environment configuration
+├── core/                # preserved trading kernel + runtime supervisor
+├── scanner/             # RF scanner + Deep Radar + balanced universe
+├── strategy/            # strategy facade
+├── portfolio/           # multi-position state isolation + allocation
+├── execution/           # execution service boundary
+├── news/                # RSS/news/event-risk layer
+├── dashboard/           # Flask dashboard/UI
+├── tests/               # structural/regression tests
+├── archive/             # untouched original source backup
+├── main.py              # thin Windows entrypoint
+├── verify_project.py    # offline syntax/compile verification
+├── run_windows.bat      # Windows setup + test gate + startup
+├── .env.example
+├── requirements.txt
+├── ARCHITECTURE.md
+├── README.md
+└── CHANGELOG.md
