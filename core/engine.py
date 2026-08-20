@@ -4430,6 +4430,48 @@ DASHBOARD_STATE = {
     "institutional_flow": {}
 }
 
+def publish_position_state(symbol, side, entry, qty, pnl=0.0):
+    """Canonical runtime position publisher owned by the execution layer.
+
+    Execution commits real STATE first, then projects it here for consumers.
+    The dashboard module only reads this state; it never owns it.
+    """
+    DASHBOARD_STATE["position"] = {
+        "symbol": symbol,
+        "side": side,
+        "entry": round(entry, 4),
+        "qty": qty,
+        "pnl": round(pnl, 2),
+        "sl": round(STATE.get("synthetic_sl", 0), 4),
+        "tp1": round(STATE.get("synthetic_tp1", 0), 4),
+        "tp2": round(STATE.get("tp2_price", 0), 4),
+        "tp1_done": STATE.get("tp1_hit", False),
+        "trailing_active": STATE.get("trail_activated", False),
+        "regime": MEMORY.get("regime", "UNKNOWN"),
+        "trade_type": STATE.get("trade_type", "N/A"),
+        "entry_type": STATE.get("entry_type", "N/A"),
+        "classification": STATE.get("classification", "N/A"),
+        "location": STATE.get("location", "N/A"),
+        "zone": STATE.get("zone_info", "N/A"),
+        "score": STATE.get("trade_score", 0),
+        "narrative_classification": STATE.get("narrative_classification", ""),
+        "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+        "confidence_level": STATE.get("confidence_level", ""),
+        "current_confidence": STATE.get("current_confidence", 50.0),
+        "market_regime": STATE.get("market_regime", "UNKNOWN"),
+        "continuation_pressure": STATE.get("continuation_pressure", 50),
+        "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
+        "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
+        "delay_tp1": STATE.get("delay_tp1", False)
+    }
+
+def update_position_dashboard(symbol, side, entry, qty, pnl=0.0):
+    """Backward-compatible alias: execution never depends on dashboard code."""
+    publish_position_state(symbol, side, entry, qty, pnl)
+
+def clear_position_dashboard():
+    DASHBOARD_STATE["position"] = None
+
 # ========== FULL log_execution (debounce + dashboard) ==========
 def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
     if debounce_key:
@@ -4685,6 +4727,70 @@ def detect_fvg(df, threshold=0.001):
         return ("bearish", curr['high'], prev['low'])
     return None
 
+def compute_zone_strength(df, level, zone_type, atr, ob):
+    """Canonical institutional zone-strength scorer.
+
+    Evaluates touch recency, volume at touches, reaction count, order-book
+    liquidity, structure (BOS/shift) and rejection wicks. Returns
+    (strength 0-10, details). Engine is the single owner; the scanner module
+    resolves this via its core-namespace import.
+    """
+    price = df['close'].iloc[-1]
+    touch_indices = []
+    for i in range(max(0, len(df)-30), len(df)):
+        candle_high = df['high'].iloc[i]
+        candle_low = df['low'].iloc[i]
+        if (zone_type == "support" and abs(candle_low - level) < atr) or \
+           (zone_type == "resistance" and abs(candle_high - level) < atr):
+            touch_indices.append(i)
+    vol_strength = 0
+    if touch_indices:
+        volumes = df['volume'].iloc[touch_indices]
+        avg_vol = volumes.mean()
+        overall_avg = df['volume'].iloc[-30:].mean() if len(df) >= 30 else df['volume'].mean()
+        vol_strength = min(3.0, avg_vol / overall_avg) if overall_avg > 0 else 0
+    reaction_count = 0
+    for idx in touch_indices:
+        if idx < len(df)-1:
+            next_close = df['close'].iloc[idx+1]
+            if (zone_type == "support" and next_close > df['close'].iloc[idx]) or \
+               (zone_type == "resistance" and next_close < df['close'].iloc[idx]):
+                reaction_count += 1
+    reaction_score = min(3.0, reaction_count)
+    liquidity_score = 0
+    if ob:
+        obi = orderbook_imbalance(ob)
+        if zone_type == "support" and obi > 0.1:
+            liquidity_score = 2
+        elif zone_type == "resistance" and obi < -0.1:
+            liquidity_score = 2
+        elif abs(obi) > 0.05:
+            liquidity_score = 1
+    inst_score = 0
+    bos_up, bos_down = detect_bos(df, lookback=5)
+    struct_shift = detect_structure_shift(df)
+    if zone_type == "support" and (bos_up or struct_shift == "bullish_shift"):
+        inst_score = 2
+    elif zone_type == "resistance" and (bos_down or struct_shift == "bearish_shift"):
+        inst_score = 2
+    rejection_score = 0
+    if len(df) >= 1:
+        last = df.iloc[-1]
+        body, range_, upper_wick, lower_wick = candle_metrics(last)
+        if zone_type == "support" and lower_wick > body * 1.5 and abs(last['low'] - level) < atr:
+            rejection_score = 2
+        elif zone_type == "resistance" and upper_wick > body * 1.5 and abs(last['high'] - level) < atr:
+            rejection_score = 2
+    total = vol_strength + reaction_score + liquidity_score + inst_score + rejection_score
+    strength = min(10.0, total * 10 / 10)
+    return round(strength, 1), {
+        "vol_strength": round(vol_strength, 1),
+        "reaction_count": reaction_count,
+        "liquidity_score": liquidity_score,
+        "institutional_score": inst_score,
+        "rejection_score": rejection_score
+    }
+
 def get_smart_zones(symbol, df, ob=None):
     """Canonical smart-zone provider used by strategy and deep scanner.
 
@@ -4883,23 +4989,36 @@ def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, mom
     MEMORY["watchlist"][symbol] = entry
 
 def cleanup_watchlist(ttl=300):
+    """Watchlist lifecycle maintenance — invoked only by the runtime worker.
+
+    Read paths (dashboard/API) must never call this. Malformed records are
+    quarantined and removed immediately; stale records first transition to
+    EXPIRED and are removed only if still expired after another TTL window,
+    so a transient analysis failure cannot silently erase a valid setup.
+    """
     now = time.time()
     if "watchlist" not in MEMORY:
         return
-    expired = []
+    quarantine = MEMORY.setdefault("watchlist_quarantine", [])
     for sym, v in list(MEMORY["watchlist"].items()):
-        if not isinstance(v, dict):
-            expired.append(sym)
+        if not isinstance(v, dict) or not v.get("symbol"):
+            MEMORY["watchlist"].pop(sym, None)
+            quarantine.append({"key": sym, "reason": "MALFORMED_RECORD", "ts": now})
+            MEMORY["watchlist_quarantine"] = quarantine[-50:]
             continue
         last_update = v.get("last_update", v.get("updated_at", 0))
         try:
             last_update = float(last_update or 0)
         except (TypeError, ValueError):
             last_update = 0.0
-        if last_update <= 0 or now - last_update > ttl:
-            expired.append(sym)
-    for sym in expired:
-        MEMORY["watchlist"].pop(sym, None)
+        v["last_update"] = last_update
+        stale = last_update <= 0 or now - last_update > ttl
+        if stale and v.get("state") != "EXPIRED":
+            v["state"] = "EXPIRED"
+            v["expired_at"] = now
+            v["status"] = "DATA_STALE"
+        elif v.get("state") == "EXPIRED" and now - float(v.get("expired_at", now)) > ttl:
+            MEMORY["watchlist"].pop(sym, None)
 
 # ========== VWAP ENGINE ==========
 def compute_vwap(df):

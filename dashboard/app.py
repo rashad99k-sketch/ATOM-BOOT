@@ -30,38 +30,14 @@ def _control_authorized():
         supplied = str(body.get("control_token", ""))
     return bool(DASHBOARD_CONTROL_TOKEN) and hmac.compare_digest(supplied, DASHBOARD_CONTROL_TOKEN)
 
+_update_position_dashboard_impl = E.update_position_dashboard
+
 def update_position_dashboard(symbol, side, entry, qty, pnl=0.0):
-    DASHBOARD_STATE["position"] = {
-        "symbol": symbol,
-        "side": side,
-        "entry": round(entry, 4),
-        "qty": qty,
-        "pnl": round(pnl, 2),
-        "sl": round(STATE.get("synthetic_sl", 0), 4),
-        "tp1": round(STATE.get("synthetic_tp1", 0), 4),
-        "tp2": round(STATE.get("tp2_price", 0), 4),
-        "tp1_done": STATE.get("tp1_hit", False),
-        "trailing_active": STATE.get("trail_activated", False),
-        "regime": MEMORY.get("regime", "UNKNOWN"),
-        "trade_type": STATE.get("trade_type", "N/A"),
-        "entry_type": STATE.get("entry_type", "N/A"),
-        "classification": STATE.get("classification", "N/A"),
-        "location": STATE.get("location", "N/A"),
-        "zone": STATE.get("zone_info", "N/A"),
-        "score": STATE.get("trade_score", 0),
-        "narrative_classification": STATE.get("narrative_classification", ""),
-        "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-        "confidence_level": STATE.get("confidence_level", ""),
-        "current_confidence": STATE.get("current_confidence", 50.0),
-        "market_regime": STATE.get("market_regime", "UNKNOWN"),
-        "continuation_pressure": STATE.get("continuation_pressure", 50),
-        "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
-        "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-        "delay_tp1": STATE.get("delay_tp1", False)
-    }
+    """Project the engine-owned canonical position state for the dashboard."""
+    _update_position_dashboard_impl(symbol, side, entry, qty, pnl)
 
 def clear_position_dashboard():
-    DASHBOARD_STATE["position"] = None
+    E.clear_position_dashboard()
 
 def render_live_supervisor_panel():
     return """
@@ -399,7 +375,7 @@ def dashboard():
     
     html = f"""
 <!DOCTYPE html>
-<html><head><title>RF v28 Fixed Live Supervisor</title>
+<html><head><title>RF Liquidity Pro v28 Fixed Live Supervisor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
@@ -423,7 +399,7 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 </style>
 </head>
 <body>
-<div class="header">🔥 RF v28 Fixed Live Supervisor</div>
+<div class="header">🔥 RF Liquidity Pro — v28 Fixed Live Supervisor</div>
 {decision_panel_html}
 {scanner_v2_section}
 {queue_panel_html}
@@ -640,7 +616,8 @@ function updateUI(d) {{
     document.getElementById("errors").innerHTML = (d.errors || []).slice(-5).join("<br>");
     let top5Html = "";
     (d.top5 || []).forEach(o => {{
-        top5Html += `<div><b>${{o.symbol}}</b> | Score: ${{o.score.toFixed(2)}} | ADX: ${{o.adx || 0}} | RSI: ${{o.rsi || 0}}</div><hr>`;
+        const sc = Number(o.score ?? o.radar_score ?? 0);
+        top5Html += `<div><b>${{o.symbol}}</b> | Score: ${{sc.toFixed(2)}} | ADX: ${{o.adx || 0}} | RSI: ${{o.rsi ?? "-"}}</div><hr>`;
     }});
     document.getElementById("top5").innerHTML = top5Html || "No opportunities";
     const radar = d.deep_radar || [];
@@ -683,6 +660,14 @@ function updateUI(d) {{
             if (w.distribution_risk !== undefined) extraInfo += ` | DistRisk: ${{w.distribution_risk}}`;
             if (w.momentum_expansion) extraInfo += ` | 🚀`;
             if (w.momentum_decay) extraInfo += ` | 📉`;
+            if (w.news_state) {{
+                const nc = {{NEWS_SUPPORT:"#2ecc71",NEWS_CONFLICT:"#e74c3c",NEWS_RISK:"#e74c3c",NEWS_NEUTRAL:"#95a5a6",NEWS_UNAVAILABLE:"#f1c40f"}}[w.news_state] || "#95a5a6";
+                extraInfo += ` | <span style="color:${{nc}}">${{w.news_state}}</span>`;
+            }}
+            if (w.data_quality && w.data_quality !== "OK") extraInfo += ` | <span style="color:#f1c40f">DQ:${{w.data_quality}}</span>`;
+            if (w.zone_status && w.zone_status !== "OK") extraInfo += ` | <span style="color:#e74c3c">${{w.zone_status}}</span>`;
+            if (w.zone) extraInfo += ` | Zone:${{w.zone.type}} @${{w.zone.price}} str=${{w.zone.strength}}`;
+            if (w.analysis_age !== undefined) extraInfo += ` | Age:${{w.analysis_age}}s`;
             wHtml += `<div style="margin-bottom:8px; border-bottom:1px solid #2c3e50; padding-bottom:4px;">
               <b>${{sideIcon}} ${{w.symbol}}</b> | Score: ${{w.score}} | <span style="color:${{stateColor}}">${{w.state}}</span> | ${{w.trade_type}} | ${{strengthIcon}} ${{w.strength}}
               <br>Reasons: ${{reasonsStr}}
@@ -888,7 +873,8 @@ def data():
         health = MEMORY["health"].copy()
         health["errors"] = len(DASHBOARD_STATE["errors"])
         top5 = MEMORY.get("top_candidates", [])[:5] if "top_candidates" in MEMORY else []
-        cleanup_watchlist()
+        # Read-only route: watchlist lifecycle cleanup runs exclusively in the
+        # runtime worker (core.runtime._service_watchlist_and_queue).
         watchlist_data = MEMORY.get("watchlist", {})
         no_entry_feed = MEMORY.get("no_entry_feed", [])[-5:]
         live_data = {}
@@ -1103,7 +1089,7 @@ def scanner_endpoint():
 
 @app.route("/watchlist")
 def watchlist_endpoint():
-    cleanup_watchlist()
+    # Read-only route: never mutates MEMORY["watchlist"].
     return jsonify({"status": "OK", "count": len(MEMORY.get("watchlist", {})),
                     "items": safe_json(MEMORY.get("watchlist", {}))}), 200
 

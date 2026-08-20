@@ -34,6 +34,8 @@ class NewsAssessment:
     macro_risk: float = 0.0
     symbol_risk: float = 0.0
     provider: str = "NONE"
+    direct_count: int = 0
+    macro_event: bool = False
 
     def as_dict(self):
         return {
@@ -45,6 +47,8 @@ class NewsAssessment:
             "event_types": list(dict.fromkeys(self.event_types or [])),
             "macro_risk": round(float(self.macro_risk), 1),
             "symbol_risk": round(float(self.symbol_risk), 1),
+            "direct_count": int(self.direct_count),
+            "macro_event": bool(self.macro_event),
         }
 
 
@@ -104,6 +108,50 @@ class NewsService:
     @staticmethod
     def _clean_symbol(symbol: str) -> str:
         return re.sub(r"[^A-Za-z0-9.\-]", " ", symbol.replace(":USDT", "").replace("/USDT", "").replace("-USDT", "")).strip()
+
+    @classmethod
+    def _entity_aliases(cls, symbol: str, asset_class: str) -> List[str]:
+        """Aliases used to verify that a headline actually concerns the instrument.
+
+        A headline that merely arrived from a query is NOT evidence; at least
+        one alias must appear in the title/snippet for the article to count as
+        direct instrument news.
+        """
+        base = cls._clean_symbol(symbol).lower()
+        aliases = {base} if base else set()
+        crypto_known = {
+            "btc": ["bitcoin", "btc"],
+            "eth": ["ethereum", "ether", "eth"],
+            "sol": ["solana", "sol"],
+            "xrp": ["xrp", "ripple"],
+            "doge": ["dogecoin", "doge"],
+            "ada": ["cardano", "ada"],
+            "bch": ["bitcoin cash", "bch"],
+            "ltc": ["litecoin", "ltc"],
+            "link": ["chainlink", "link"],
+            "dot": ["polkadot", "dot"],
+            "avax": ["avalanche", "avax"],
+        }
+        instrument_map = {
+            "GOLD": ["gold", "xau", "bullion"],
+            "OIL": ["oil", "wti", "brent", "crude", "opec"],
+            "INDEX": ["nasdaq", "s&p", "sp500", "dow", "dow jones", "wall street"],
+            "STOCK": [base] if base else [],
+            "CRYPTO": [],
+        }
+        for alias in crypto_known.get(base, []):
+            aliases.add(alias)
+        for alias in instrument_map.get(asset_class.upper(), []):
+            aliases.add(alias)
+        alias_path = re.sub(r"[^a-z]+", " ", base.lower()).strip()
+        if alias_path:
+            aliases.add(alias_path)
+        return sorted(a for a in aliases if a and len(a) > 1)
+
+    @classmethod
+    def _is_relevant(cls, article: dict, aliases: List[str]) -> bool:
+        text = f"{article.get('title', '')} {article.get('snippet', '')}".lower()
+        return any(alias.lower() in text for alias in aliases)
 
     @classmethod
     def _query(cls, symbol: str, asset_class: str) -> str:
@@ -315,6 +363,15 @@ class NewsService:
         symbol_news, symbol_provider = self._get_cached(key, self._query(symbol, asset_class))
         global_news, global_provider = self._get_cached("GLOBAL_MACRO", self.global_query)
 
+        # Entity matching: only headlines that actually mention the instrument
+        # (or its asset-class keywords for non-equities) count as symbol news.
+        # Query-shaped noise (arbitrary Yahoo/RSS results) is discarded here.
+        aliases = self._entity_aliases(symbol, asset_class)
+        if aliases and symbol_news:
+            symbol_news = [h for h in symbol_news if self._is_relevant(h, aliases)]
+        elif not aliases:
+            symbol_news = []
+
         if not symbol_news and not global_news:
             return NewsAssessment(available=False, provider="NONE")
 
@@ -324,7 +381,10 @@ class NewsService:
         risk = min(100.0, symbol_risk + macro_risk * 0.60)
 
         merged = self._dedupe(symbol_news + global_news)[: self.max_items]
+        for h in merged:
+            h["scope"] = "DIRECT" if h in symbol_news else "MACRO"
         provider = symbol_provider if symbol_news else global_provider
+        macro_event = any(self.macro_high.search(h.get("title", "")) for h in merged)
         return NewsAssessment(
             risk=risk,
             bias=bias,
@@ -334,4 +394,32 @@ class NewsService:
             macro_risk=macro_risk,
             symbol_risk=symbol_risk,
             provider=provider,
+            direct_count=len(symbol_news),
+            macro_event=macro_event,
         )
+
+
+def news_state_for_side(assessment: "NewsAssessment", side: str,
+                        risk_block: float = 80.0) -> str:
+    """Side-aware news state for a watchlist candidate.
+
+    News is evidence, never an order signal:
+      - risk above the block threshold -> NEWS_RISK
+      - unavailable/no relevant articles -> NEWS_UNAVAILABLE
+      - bias aligned with side -> NEWS_SUPPORT, opposed -> NEWS_CONFLICT
+      - otherwise -> NEWS_NEUTRAL
+    """
+    if assessment is None or not getattr(assessment, "available", False):
+        return "NEWS_UNAVAILABLE"
+    if float(getattr(assessment, "risk", 0.0) or 0.0) >= risk_block:
+        return "NEWS_RISK"
+    # A directional claim requires direct instrument news or a real macro event;
+    # generic macro-feed noise alone is NEUTRAL evidence.
+    if not getattr(assessment, "direct_count", 0) and not getattr(assessment, "macro_event", False):
+        return "NEWS_NEUTRAL"
+    bias = getattr(assessment, "bias", "NEUTRAL")
+    if bias == "NEUTRAL":
+        return "NEWS_NEUTRAL"
+    if (side == "BUY" and bias == "BULLISH") or (side == "SELL" and bias == "BEARISH"):
+        return "NEWS_SUPPORT"
+    return "NEWS_CONFLICT"

@@ -14,7 +14,7 @@ import time
 from typing import Callable, Dict, List, Optional
 
 import core.engine as E
-from news.service import NewsService
+from news.service import NewsService, news_state_for_side
 from strategy.engine import StrategyEngine
 from scanner.universe import build_balanced
 
@@ -137,45 +137,61 @@ class DeepScanner:
 
     @staticmethod
     def _zone_context(sym: str, df) -> dict:
-        """Return nearest support/resistance context without fetching the order book."""
-        try:
-            zones = E.get_smart_zones(sym, df, None)
-            price = float(df["close"].iloc[-1])
-            buy = zones.get("buy_zones", [])
-            sell = zones.get("sell_zones", [])
-            buy_near = min(
-                buy,
-                key=lambda z: abs(price - float(z["price"])) / price,
-                default=None,
-            )
-            sell_near = min(
-                sell,
-                key=lambda z: abs(price - float(z["price"])) / price,
-                default=None,
-            )
-            buy_dist = (
-                abs(price - float(buy_near["price"])) / price if buy_near else 999.0
-            )
-            sell_dist = (
-                abs(price - float(sell_near["price"])) / price if sell_near else 999.0
-            )
-            return {
-                "buy_zone": buy_near,
-                "sell_zone": sell_near,
-                "buy_distance": buy_dist,
-                "sell_distance": sell_dist,
-                "buy_strength": float(buy_near.get("strength", 0)) if buy_near else 0.0,
-                "sell_strength": float(sell_near.get("strength", 0)) if sell_near else 0.0,
-            }
-        except Exception:
-            return {
-                "buy_zone": None,
-                "sell_zone": None,
-                "buy_distance": 999.0,
-                "sell_distance": 999.0,
-                "buy_strength": 0.0,
-                "sell_strength": 0.0,
-            }
+        """Return nearest support/resistance context with explicit zone_status.
+
+        A computation failure is reported as ZONE_ERROR, an empty result as
+        NO_VALID_ZONE, and missing frames as DATA_UNAVAILABLE — never silently
+        folded into a legitimate distance/score.
+        """
+        status = "OK"
+        if df is None or len(df) < 2:
+            status = "DATA_UNAVAILABLE"
+            zones = {"buy_zones": [], "sell_zones": []}
+        else:
+            try:
+                zones = E.get_smart_zones(sym, df, None)
+            except Exception as exc:
+                zones = {"buy_zones": [], "sell_zones": []}
+                status = "ZONE_ERROR"
+                E.log_execution(f"[RADAR] zone computation failed for {sym}: {exc}", "WARN",
+                                debounce_key=f"zone_err_{sym}", debounce_sec=300)
+            if status == "OK" and not zones.get("buy_zones") and not zones.get("sell_zones"):
+                status = "NO_VALID_ZONE"
+        result = {
+            "zone_status": status,
+            "buy_zone": None,
+            "sell_zone": None,
+            "buy_distance": 999.0,
+            "sell_distance": 999.0,
+            "buy_strength": 0.0,
+            "sell_strength": 0.0,
+        }
+        if df is None or len(df) < 2:
+            return result
+        price = float(df["close"].iloc[-1])
+        buy = zones.get("buy_zones", [])
+        sell = zones.get("sell_zones", [])
+        buy_near = min(
+            buy,
+            key=lambda z: abs(price - float(z["price"])) / price,
+            default=None,
+        )
+        sell_near = min(
+            sell,
+            key=lambda z: abs(price - float(z["price"])) / price,
+            default=None,
+        )
+        result["buy_zone"] = buy_near
+        result["sell_zone"] = sell_near
+        result["buy_distance"] = (
+            abs(price - float(buy_near["price"])) / price if buy_near else 999.0
+        )
+        result["sell_distance"] = (
+            abs(price - float(sell_near["price"])) / price if sell_near else 999.0
+        )
+        result["buy_strength"] = float(buy_near.get("strength", 0)) if buy_near else 0.0
+        result["sell_strength"] = float(sell_near.get("strength", 0)) if sell_near else 0.0
+        return result
 
     def _radar(self, rows: List[dict]) -> List[dict]:
         radar = []
@@ -264,6 +280,8 @@ class DeepScanner:
                         "sell_distance": round(zones["sell_distance"] * 100, 3),
                         "buy_zone_strength": round(zones["buy_strength"], 1),
                         "sell_zone_strength": round(zones["sell_strength"], 1),
+                        "zone_status": zones["zone_status"],
+                        "data_quality": "OK" if zones["zone_status"] == "OK" else zones["zone_status"],
                     }
                 )
             except Exception as exc:
@@ -427,6 +445,20 @@ class DeepScanner:
             df.symbol = sym
             ob = E.get_orderbook_cached(sym, limit=10)
             news = self.news.assess(sym, asset)
+            analysis_age = max(0.0, time.time() - float(entry.get("last_update", time.time()) or 0))
+            data_age = 0.0
+            try:
+                if "timestamp" in df.columns:
+                    ts_last = df["timestamp"].iloc[-1]
+                    ts_last = ts_last.timestamp() if hasattr(ts_last, "timestamp") else float(ts_last) / 1000.0
+                    data_age = max(0.0, time.time() - ts_last)
+            except Exception:
+                data_age = 0.0
+            data_quality = "OK"
+            if data_age > 900:
+                data_quality = "STALE"
+            elif ob is None:
+                data_quality = "DEGRADED_NO_ORDERBOOK"
             ob_imbalance = self._orderbook_imbalance(ob)
 
             analyses = []
@@ -489,6 +521,33 @@ class DeepScanner:
             intent_details = best.get("intent_details") or {}
             fvg = self._fvg_context(df, best["side"])
 
+            # Attach the canonical engine-owned zone for the winning side.
+            zone_payload = None
+            zone_status = "NO_VALID_ZONE"
+            try:
+                zmap = E.get_smart_zones(sym, df, ob)
+                side_zones = zmap.get("buy_zones") if best["side"] == "BUY" else zmap.get("sell_zones")
+                if side_zones:
+                    z = side_zones[0]
+                    zone_payload = {
+                        "side": best["side"],
+                        "price": float(z.get("price", z.get("level", 0.0))),
+                        "strength": float(z.get("strength", 0.0)),
+                        "type": z.get("type", "ZONE"),
+                        "reaction_count": int((z.get("details") or {}).get("reaction_count", 0)),
+                        "institutional_score": float((z.get("details") or {}).get("institutional_score", 0.0)),
+                    }
+                    zone_status = "OK"
+            except Exception as exc:
+                zone_status = "ZONE_ERROR"
+                self.stats["errors"] += 1
+                E.log_execution(
+                    f"[WATCHLIST] {sym} zone attach failed: {exc}",
+                    "WARN",
+                    debounce_key=f"watch_zone_{sym}",
+                    debounce_sec=300,
+                )
+
             entry.update(
                 {
                     "side": best["side"],
@@ -517,9 +576,17 @@ class DeepScanner:
                     "news": news.as_dict(),
                     "news_risk": float(news.risk),
                     "news_bias": news.bias,
+                    "news_state": news_state_for_side(
+                        news, best["side"], float(os.getenv("NEWS_RISK_BLOCK", "80"))
+                    ),
+                    "zone": zone_payload,
+                    "zone_status": zone_status,
                     "orderbook_imbalance": round(ob_imbalance, 4),
                     "fvg": fvg,
                     "deep_analyzed": True,
+                    "analysis_age": round(analysis_age, 1),
+                    "data_age": round(data_age, 1),
+                    "data_quality": data_quality,
                     "last_update": time.time(),
                 }
             )

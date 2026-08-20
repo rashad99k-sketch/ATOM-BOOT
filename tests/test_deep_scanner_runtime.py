@@ -50,9 +50,18 @@ def _install_stubs():
     class FakeNews:
         def assess(self, *args, **kwargs):
             return types.SimpleNamespace(
-                bias="NEUTRAL", risk=0, as_dict=lambda: {"available": False, "risk": 0, "bias": "NEUTRAL", "headlines": []}
+                available=False, bias="NEUTRAL", risk=0,
+                direct_count=0, macro_event=False,
+                as_dict=lambda: {"available": False, "risk": 0, "bias": "NEUTRAL", "headlines": []}
             )
     news_mod.NewsService = FakeNews
+    def _fake_news_state_for_side(assessment, side, risk_block=80.0):
+        if assessment is None or not getattr(assessment, "available", False):
+            return "NEWS_UNAVAILABLE"
+        if float(getattr(assessment, "risk", 0.0) or 0.0) >= risk_block:
+            return "NEWS_RISK"
+        return "NEWS_NEUTRAL"
+    news_mod.news_state_for_side = _fake_news_state_for_side
     sys.modules["news.service"] = news_mod
 
     strategy_mod = types.ModuleType("strategy.engine")

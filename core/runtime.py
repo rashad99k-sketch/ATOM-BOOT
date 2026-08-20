@@ -132,7 +132,22 @@ def _run_discovery():
     try:
         cands = scan_market_rf(top_n=40)
         MEMORY["rf_candidates"] = cands
-        MEMORY["rf_dashboard"] = MEMORY.get("rf_dashboard", [])
+        # Rebuild the RF dashboard from the candidates just scanned (shape-
+        # compatible with the legacy build_rf_dashboard output) without a
+        # second market scan.
+        MEMORY["rf_dashboard"] = [
+            {
+                "symbol": c.get("symbol"),
+                "status": c.get("status", "PROXIMITY"),
+                "icon": "🔔" if c.get("rf_triggered") else "📡",
+                "score": c.get("score", 0),
+                "adx": c.get("adx", 0),
+                "rsi": c.get("rsi", 0),
+                "atrp": c.get("atrp", 0),
+                "signal": c.get("rf_signal") or "N/A",
+            }
+            for c in (cands or [])
+        ]
         MEMORY["rf_last_scan"] = time.time()
     except Exception as exc:
         log_execution(f"[SCANNER] RF auxiliary: {exc}", "WARN")
@@ -173,6 +188,12 @@ def _service_watchlist_and_queue():
     except Exception as exc:
         log_execution(f"[QUEUE] promotion error: {exc}", "WARN")
 
+    # Lifecycle cleanup lives here, never in dashboard read routes.
+    try:
+        cleanup_watchlist(float(os.getenv("WATCHLIST_EXPIRE_AFTER_SEC", "600")))
+    except Exception as exc:
+        log_execution(f"[WATCHLIST] cleanup error: {exc}", "WARN")
+
     MEMORY["queue_status"] = queue.get_status() if USE_EXECUTION_QUEUE else {}
 
 def _execute_ready_queue_candidate():
@@ -184,6 +205,20 @@ def _execute_ready_queue_candidate():
     """
     if not USE_EXECUTION_QUEUE:
         return False
+
+    # Safety barrier: emergency kill switch (daily drawdown / loss limit) must
+    # actually gate new entries, not merely exist as dead code.
+    try:
+        if emergency_kill_switch_active():
+            log_execution(
+                "[SAFETY] Kill switch active — new entries blocked",
+                "WARN",
+                debounce_key="kill_switch_active",
+                debounce_sec=300,
+            )
+            return False
+    except Exception as exc:
+        log_execution(f"[SAFETY] kill-switch check failed: {exc}", "WARN")
 
     slots = PORTFOLIO.max_positions - PORTFOLIO.count()
     if slots <= 0:

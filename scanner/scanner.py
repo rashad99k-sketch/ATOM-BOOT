@@ -779,87 +779,13 @@ def radar_entry_scan():
                     return True
     return False
 
-def compute_zone_strength(df, level, zone_type, atr, ob):
-    price = df['close'].iloc[-1]
-    dist_pct = abs(price - level) / price
-    touch_indices = []
-    for i in range(max(0, len(df)-30), len(df)):
-        candle_high = df['high'].iloc[i]
-        candle_low = df['low'].iloc[i]
-        if (zone_type == "support" and abs(candle_low - level) < atr) or \
-           (zone_type == "resistance" and abs(candle_high - level) < atr):
-            touch_indices.append(i)
-    vol_strength = 0
-    if touch_indices:
-        volumes = df['volume'].iloc[touch_indices]
-        avg_vol = volumes.mean()
-        overall_avg = df['volume'].iloc[-30:].mean() if len(df) >= 30 else df['volume'].mean()
-        vol_strength = min(3.0, avg_vol / overall_avg) if overall_avg > 0 else 0
-    reaction_count = 0
-    for idx in touch_indices:
-        if idx < len(df)-1:
-            next_close = df['close'].iloc[idx+1]
-            if (zone_type == "support" and next_close > df['close'].iloc[idx]) or \
-               (zone_type == "resistance" and next_close < df['close'].iloc[idx]):
-                reaction_count += 1
-    reaction_score = min(3.0, reaction_count)
-    liquidity_score = 0
-    if ob:
-        obi = orderbook_imbalance(ob)
-        if zone_type == "support" and obi > 0.1:
-            liquidity_score = 2
-        elif zone_type == "resistance" and obi < -0.1:
-            liquidity_score = 2
-        elif abs(obi) > 0.05:
-            liquidity_score = 1
-    inst_score = 0
-    bos_up, bos_down = detect_bos(df, lookback=5)
-    struct_shift = detect_structure_shift(df)
-    if zone_type == "support" and (bos_up or struct_shift == "bullish_shift"):
-        inst_score = 2
-    elif zone_type == "resistance" and (bos_down or struct_shift == "bearish_shift"):
-        inst_score = 2
-    rejection_score = 0
-    if len(df) >= 1:
-        last = df.iloc[-1]
-        body, range_, upper_wick, lower_wick = candle_metrics(last)
-        if zone_type == "support" and lower_wick > body * 1.5 and abs(last['low'] - level) < atr:
-            rejection_score = 2
-        elif zone_type == "resistance" and upper_wick > body * 1.5 and abs(last['high'] - level) < atr:
-            rejection_score = 2
-    total = vol_strength + reaction_score + liquidity_score + inst_score + rejection_score
-    strength = min(10.0, total * 10 / 10)
-    return round(strength, 1), {
-        "vol_strength": round(vol_strength, 1),
-        "reaction_count": reaction_count,
-        "liquidity_score": liquidity_score,
-        "institutional_score": inst_score,
-        "rejection_score": rejection_score
-    }
+# Zone analysis lives exclusively in core.engine (canonical implementations
+# compute_zone_strength / get_smart_zones). This module receives them through
+# the core-namespace import above; any local copies previously here diverged
+# and were removed to keep a single zone-analysis contract.
 
 def build_smart_zone_map(symbol, df, ob=None):
-    atr = compute_atr(df).iloc[-1]
-    supports, resistances = get_clustered_zones(df, lookback=120, cluster_pct=0.002)
-    buy_zones = []
-    for sup in supports:
-        strength, details = compute_zone_strength(df, sup, "support", atr, ob)
-        buy_zones.append({"price": sup, "strength": strength, "details": details, "type": "support"})
-    sell_zones = []
-    for res in resistances:
-        strength, details = compute_zone_strength(df, res, "resistance", atr, ob)
-        sell_zones.append({"price": res, "strength": strength, "details": details, "type": "resistance"})
-    buy_zones.sort(key=lambda x: x["strength"], reverse=True)
-    sell_zones.sort(key=lambda x: x["strength"], reverse=True)
-    return {"buy_zones": buy_zones, "sell_zones": sell_zones}
-
-def get_smart_zones(symbol, df, ob):
-    key = f"smart_zones_{symbol}"
-    cached = MEMORY.get(key)
-    if cached and time.time() - cached.get("ts", 0) < 90:
-        return cached["data"]
-    zones = build_smart_zone_map(symbol, df, ob)
-    MEMORY[key] = {"data": zones, "ts": time.time()}
-    return zones
+    return E.get_smart_zones(symbol, df, ob)
 
 # ========== NEW LIQUIDITY DISCOVERY LAYER ==========
 class FreshLiquidityRadar:
@@ -1141,7 +1067,7 @@ def promote_to_queue():
             continue
         if not item.get("deep_analyzed"):
             continue
-        if item.get("state") == "NEWS_RISK":
+        if item.get("state") in {"NEWS_RISK", "EXPIRED", "INVALIDATED", "ERROR", "DATA_DEGRADED"}:
             continue
         if float(item.get("news_risk", 0)) >= news_block:
             continue
