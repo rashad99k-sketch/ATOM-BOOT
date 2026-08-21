@@ -25,7 +25,7 @@ try:
     from core.msb_ob import (
         LONG, SHORT, STATUS_ACTIVE, STATUS_TOUCHED, STATUS_MITIGATING,
         STATUS_INVALIDATED, STATUS_EXPIRED, analyze_msb,
-        msb_context, rank_zones,
+        msb_context, rank_zones, temporal_sequence,
     )
 except Exception:  # pragma: no cover - defensive fallback for stubbed-parent-package sessions
     import importlib as _il
@@ -40,6 +40,7 @@ except Exception:  # pragma: no cover - defensive fallback for stubbed-parent-pa
     analyze_msb = getattr(_msb, "analyze_msb")
     msb_context = getattr(_msb, "msb_context")
     rank_zones = getattr(_msb, "rank_zones")
+    temporal_sequence = getattr(_msb, "temporal_sequence")
 
 
 class DeepScanner:
@@ -641,6 +642,16 @@ class DeepScanner:
                         )
                         if ctx_obj is not None:
                             msb_ctx = ctx_obj.to_dict()
+                        seq = temporal_sequence(
+                            df, sym, side_int, E.queue,
+                            zone=primary_zone, msb_event=primary_msb_event,
+                            atr=atr_for_ctx,
+                        )
+                        if seq is not None:
+                            if msb_ctx is not None:
+                                msb_ctx["temporal"] = seq.to_dict()
+                            else:
+                                msb_ctx = {"temporal": seq.to_dict()}
             except Exception as exc:
                 self.stats["errors"] += 1
                 E.log_execution(

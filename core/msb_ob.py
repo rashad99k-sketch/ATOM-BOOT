@@ -555,3 +555,197 @@ def rank_zones(zones: List[dict], side: int) -> Tuple[Optional[dict], Optional[d
     primary = usable[0] if usable else None
     secondary = usable[1] if len(usable) > 1 else None
     return primary, secondary
+
+
+# ---------------------------------------------------------------------------
+# Temporal / causal sequence validation
+# ---------------------------------------------------------------------------
+
+EVENT_LIQUIDITY_SWEEP = "LIQUIDITY_SWEEP"
+EVENT_DISPLACEMENT = "DISPLACEMENT"
+EVENT_MSB = "MSB"
+EVENT_OB_CREATED = "OB_CREATED"
+EVENT_RETEST = "RETEST"
+EVENT_REJECTION = "REJECTION"
+EVENT_CURRENT_STATE = "CURRENT_STATE"
+
+SEQ_NONE = "NO_LIQUIDITY_SEQUENCE"
+SEQ_LIQUIDITY_ONLY = "LIQUIDITY_ONLY"
+SEQ_LIQUIDITY_THEN_STRUCTURE = "LIQUIDITY_THEN_STRUCTURE"
+SEQ_STRUCT_ONLY = "STRUCTURAL_BREAK_WITHOUT_LIQUIDITY"
+SEQ_FULL = "FULL_INSTITUTIONAL_SEQUENCE"
+SEQ_INVALID = "INVALID_SEQUENCE"
+
+_NOT_CONFIRMED_LABEL = "NOT CONFIRMED"
+
+
+@dataclass
+class EventTimelineEntry:
+    event: str
+    index: Optional[int]  # bar index, None if NOT CONFIRMED
+
+    def to_dict(self) -> dict:
+        return {"event": self.event,
+                "index": None if self.index is None else int(self.index),
+                "label": None if self.index is not None else _NOT_CONFIRMED_LABEL}
+
+
+@dataclass
+class TemporalSequenceAssessment:
+    symbol: str
+    side: int
+    sequence: str
+    timeline: List[EventTimelineEntry]
+    sweep_bar: Optional[int]
+    displacement_bar: Optional[int]
+    msb_bar: Optional[int]
+    ob_bar: Optional[int]
+    retest_bar: Optional[int]
+    rejection_bar: Optional[int]
+
+    def to_dict(self) -> dict:
+        return {
+            "symbol": self.symbol,
+            "side": "LONG" if self.side == LONG else "SHORT",
+            "sequence": self.sequence,
+            "timeline": [e.to_dict() for e in self.timeline],
+            "bars": {
+                "sweep": self.sweep_bar,
+                "displacement": self.displacement_bar,
+                "msb": self.msb_bar,
+                "ob": self.ob_bar,
+                "retest": self.retest_bar,
+                "rejection": self.rejection_bar,
+            },
+        }
+
+
+def _first_bar_in_zone(closes, side: int, top: float, bottom: float, start: int) -> Optional[int]:
+    if side == LONG:
+        for i in range(start, len(closes)):
+            if closes[i] < top:
+                return i
+    else:
+        for i in range(start, len(closes)):
+            if closes[i] > bottom:
+                return i
+    return None
+
+
+def _first_strong_rejection(opens, closes, side: int, start: int) -> Optional[int]:
+    for i in range(start, len(closes)):
+        if side == LONG and closes[i] > opens[i]:
+            return i
+        if side == SHORT and closes[i] < opens[i]:
+            return i
+    return None
+
+
+def temporal_sequence(df, symbol: str, side: int, queue_engine,
+                      *,
+                      zone: Optional[dict] = None,
+                      msb_event: Optional[dict] = None,
+                      atr: float = 0.0) -> Optional[TemporalSequenceAssessment]:
+    """Determine the causal sequence for a candidate using bar indices only.
+
+    Emits a deterministic event timeline (missing events = NOT CONFIRMED)
+    and a sequence classification:
+      NO_LIQUIDITY_SEQUENCE / LIQUIDITY_ONLY / LIQUIDITY_THEN_STRUCTURE /
+      STRUCTURAL_BREAK_WITHOUT_LIQUIDITY / FULL_INSTITUTIONAL_SEQUENCE /
+      INVALID_SEQUENCE.
+    """
+    if df is None or atr <= 0:
+        return None
+    n = len(df)
+    closes = list(df["close"].values)
+    opens = list(df["open"].values)
+    highs = list(df["high"].values)
+    lows = list(df["low"].values)
+
+    eng = queue_engine
+    liq_score, liq_ev = eng._evaluate_liquidity(df, "BUY" if side == LONG else "SELL", atr)
+    sweep_age = liq_ev.get("sweep_age")
+    sweep_bar = (n - 1 - int(sweep_age)) if sweep_age is not None else None
+
+    msb_bar = int(msb_event.get("index")) if msb_event else None
+    ob_bar = int(zone.get("created_at")) if zone else None
+
+    # Re-derive the sweep restricted to the temporal scope of the MSB event:
+    # the engine's sweep_bar is the *most recent* sweep, which may sit after
+    # the MSB. For causal validation we need the sweep that actually happened
+    # before the MSB. We recompute directly from pool levels against the MSB bar.
+    if msb_bar is not None:
+        pool = eng._build_liquidity_pools(df)
+        key = "low_pools" if side == LONG else "high_pools"
+        candidates = []
+        for idx, level in pool.get(key, []):
+            for j in range(1, n):
+                if side == LONG and lows[j] < level and lows[j - 1] >= level:
+                    candidates.append(j)
+                elif side == SHORT and highs[j] > level and highs[j - 1] <= level:
+                    candidates.append(j)
+        before = [j for j in candidates if j <= msb_bar]
+        sweep_bar = max(before) if before else None
+        sweep_age = (n - 1 - sweep_bar) if sweep_bar is not None else None
+
+    # Forward-flow event detection restricted to bars < current bar
+    retest_bar = None
+    rejection_bar = None
+    if zone is not None:
+        retest_bar = _first_bar_in_zone(closes, side,
+                                        float(zone.get("top", 0.0)),
+                                        float(zone.get("bottom", 0.0)),
+                                        (ob_bar + 1) if ob_bar is not None else 0)
+        if retest_bar is not None:
+            rejection_bar = _first_strong_rejection(opens, closes, side, retest_bar)
+
+    displacement_bar = None
+    if sweep_bar is not None and msb_bar is not None:
+        # displacement exists between sweep and MSB if the direction move ≥ 1 ATR
+        # across any bar strict-enough to still precede the MSB event.
+        for j in range(sweep_bar, msb_bar + 1):
+            if side == LONG:
+                if closes[j] - lows[sweep_bar] >= atr:
+                    displacement_bar = j
+                    break
+            else:
+                if highs[sweep_bar] - closes[j] >= atr:
+                    displacement_bar = j
+                    break
+        if displacement_bar is not None and displacement_bar > msb_bar:
+            displacement_bar = None
+
+    # Causal ordering checks
+    ok_sweep = sweep_bar is not None
+    ok_disp = displacement_bar is not None
+    ok_msb = msb_bar is not None
+    ok_ob = ob_bar is not None
+    ok_retest = retest_bar is not None
+    ok_reject = rejection_bar is not None
+
+    full_ok = ok_sweep and ok_disp and ok_msb and ok_ob and (
+        (ok_retest and ok_reject) or (not ok_reject and ok_retest))
+    seq = SEQ_NONE
+    if full_ok and ok_msb and ok_ob and (sweep_bar < displacement_bar <= msb_bar <= ob_bar <=
+                    (retest_bar if ok_retest else ob_bar) <=
+                    (rejection_bar if ok_reject else retest_bar if ok_retest else ob_bar)):
+        seq = SEQ_FULL
+    elif ok_sweep and (ok_msb or ok_ob) and ok_msb and sweep_bar <= msb_bar:
+        seq = SEQ_LIQUIDITY_THEN_STRUCTURE
+    elif ok_sweep and not (ok_msb or ok_ob):
+        seq = SEQ_LIQUIDITY_ONLY
+    elif (ok_msb or ok_ob) and not ok_sweep:
+        seq = SEQ_STRUCT_ONLY
+
+    events = [EventTimelineEntry(EVENT_LIQUIDITY_SWEEP, sweep_bar),
+              EventTimelineEntry(EVENT_DISPLACEMENT, displacement_bar),
+              EventTimelineEntry(EVENT_MSB, msb_bar),
+              EventTimelineEntry(EVENT_OB_CREATED, ob_bar),
+              EventTimelineEntry(EVENT_RETEST, retest_bar),
+              EventTimelineEntry(EVENT_REJECTION, rejection_bar),
+              EventTimelineEntry(EVENT_CURRENT_STATE, n - 1)]
+    return TemporalSequenceAssessment(
+        symbol=symbol, side=side, sequence=seq, timeline=events,
+        sweep_bar=sweep_bar, displacement_bar=displacement_bar,
+        msb_bar=msb_bar, ob_bar=ob_bar, retest_bar=retest_bar,
+        rejection_bar=rejection_bar)
