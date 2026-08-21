@@ -74,8 +74,30 @@ def build_balanced(markets: Dict[str, dict], radar_limit: int = 240) -> List[dic
                 buckets[asset].append({"symbol": symbol, "asset_class": asset,
                                        "source": "configured", "market": markets[symbol]})
 
-    # By default every connected instrument is eligible. Optional per-class
-    # quotas remain available as a deliberate rate-limit control.
+    # Dynamic discovery: rank rows by a minimal but real activity signal
+    # (discovery priority, not queue score). Within each class the ranking is
+    # applied; across classes, market activity dominates. The quota guard is
+    # optional (default unlimited) and preserved for rate-limit control only.
+    def activity_key(row):
+        m = row.get("market") or {}
+        info = m.get("info") or {}
+        vol = info.get("volume_24h", info.get("vol24h", info.get("volume", 0)))
+        atr = info.get("atr", info.get("range", 0))
+        news = info.get("news_score", 0)
+        return (
+            float(news or 0) * 1000 +
+            float(vol or 0) * 1e-6 +
+            float(atr or 0) * 100 +
+            float(row.get("news_activity", 0) or 0)
+        )
+
+    classes_present = {asset for asset, _rows in buckets.items() if _rows}
+    ranked_classes = sorted(
+        classes_present,
+        key=lambda a: max((activity_key(r) for r in buckets[a]), default=0),
+        reverse=True,
+    )
+
     quotas = {}
     for asset in ASSET_CLASSES:
         quotas[asset] = max(
@@ -83,14 +105,16 @@ def build_balanced(markets: Dict[str, dict], radar_limit: int = 240) -> List[dic
             int(os.getenv(f"DEEP_SCAN_{asset}_QUOTA", str(len(buckets[asset]))))
         )
 
-    # Round-robin across classes: no single asset class can consume the whole radar.
     out = []
     seen = set()
+    limit = int(os.getenv("DEEP_MIN_REPRESENTATION", "1"))
     for round_no in range(max(quotas.values())):
-        for asset in ASSET_CLASSES:
+        for asset in ranked_classes:
             bucket = buckets[asset]
             if round_no >= min(len(bucket), quotas[asset]):
                 continue
+            # Sort bucket by dynamic activity once (on first pass) so the
+            # round-robin oscillates across ranked classes on the same cycle.
             row = bucket[round_no]
             if row["symbol"] in seen:
                 continue

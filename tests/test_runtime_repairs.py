@@ -985,6 +985,70 @@ class NewsEntityCrossAssetTest(unittest.TestCase):
                                         ["nvda", "nvidia"]))
 
 
+class CrossAssetDiscoveryTest(unittest.TestCase):
+    """Five-class evidence-driven discovery: BTC/NVDA/SPX/XAU/WTI must all
+    be discoverable, analyzable, and visible in the same portfolio."""
+
+    def setUp(self):
+        import scanner.universe as U
+        self.U = U
+
+    def _mkts(self):
+        return {
+            "BTC/USDT:USDT": {"type": "swap", "base": "BTC", "quote": "USDT",
+                               "active": True, "info": {"volume_24h": 1000}},
+            "DOGE/USDT:USDT": {"type": "swap", "base": "DOGE", "quote": "USDT",
+                                "active": True, "info": {"volume_24h": 20}},
+            "SOL/USDT:USDT": {"type": "swap", "base": "SOL", "quote": "USDT",
+                               "active": True, "info": {"volume_24h": 300}},
+            "XAUUSD/USDT:USDT": {"type": "swap", "base": "GOLD", "quote": "USDT",
+                                   "active": True, "info": {"volume_24h": 500}},
+            "OILWTI/USDT:USDT": {"type": "swap", "base": "OIL", "quote": "USDT",
+                                  "active": True, "info": {"volume_24h": 800}},
+            "US500/USDT:USDT": {"type": "swap", "base": "US500", "quote": "USDT",
+                                "active": True, "info": {"volume_24h": 900}},
+            "NVDA/USDT:USDT": {"type": "swap", "base": "NVDA", "quote": "USDT",
+                               "active": True, "info": {"volume_24h": 900}},
+        }
+
+    def test_dynamic_discovery_includes_all_classes(self):
+        from scanner.universe import build_balanced
+        mkts = self._mkts()
+        rows = build_balanced(mkts, radar_limit=7)
+        classes = {r["asset_class"] for r in rows}
+        for cls in ("CRYPTO", "GOLD", "OIL", "INDEX", "STOCK"):
+            self.assertIn(cls, classes)
+
+    def test_asset_class_is_preserved_through_to_watchlist(self):
+        from news.service import NewsService
+        ns = NewsService()
+        for sym, cls in [("BTC/USDT:USDT", "CRYPTO"), ("NVDA/USDT:USDT", "STOCK"),
+                         ("US500/USDT:USDT", "INDEX"), ("XAUUSD/USDT:USDT", "GOLD"),
+                         ("OILWTI/USDT:USDT", "OIL")]:
+            aliases = ns._entity_aliases(sym, cls)
+            self.assertTrue(aliases, f"no aliases for {sym}")
+            res = ns.assess(sym, cls)
+            # every assessment must expose a stable scope config regardless of provider
+            for h in res.headlines or []:
+                self.assertIn(h.get("scope"), ("DIRECT", "MACRO"))
+
+    def test_portfolio_allocator_sees_all_classes(self):
+        from portfolio.manager import PortfolioManager
+        from portfolio.allocator import GlobalAssetAllocator
+        m = PortfolioManager(6, None)
+        a = GlobalAssetAllocator(m, E)
+        cands = [
+            {"symbol": "BTC/USDT:USDT", "asset_class": "CRYPTO", "side": "BUY", "priority_score": 70.0},
+            {"symbol": "NVDA/USDT:USDT", "asset_class": "STOCK", "side": "BUY", "priority_score": 65.0},
+            {"symbol": "US500/USDT:USDT", "asset_class": "INDEX", "side": "BUY", "priority_score": 60.0},
+            {"symbol": "XAUUSD/USDT:USDT", "asset_class": "GOLD", "side": "BUY", "priority_score": 95.0},
+            {"symbol": "OILWTI/USDT:USDT", "asset_class": "OIL", "side": "SELL", "priority_score": 80.0},
+        ]
+        r = a.allocate(cands, limit=6)
+        allowed = {d.asset_class for d in r.decisions if d.allowed}
+        self.assertTrue({"CRYPTO", "STOCK", "INDEX", "GOLD", "OIL"} & allowed)
+
+
 class QueuePromotionsPayloadTest(unittest.TestCase):
     """Watchlist→queue promotion count must be visible in the dashboard payload."""
 

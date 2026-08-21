@@ -151,8 +151,16 @@ class DeepScanner:
         self._publish_status()
         E.MEMORY["deep_universe_counts"] = counts
         E.MEMORY["deep_universe_size"] = len(rows)
+        classes = self.ASSET_CLASSES
+        missing = [c for c in classes if c not in counts]
+        if missing:
+            # explicit per-class no-setup marker per requirement
+            E.log_execution(f"[GLOBAL] {missing[0]}: NO_QUALIFIED_SETUP",
+                            "INFO",
+                            debounce_key=f"deep_missing_{missing[0]}",
+                            debounce_sec=60)
         E.log_execution(
-            f"[DEEP] Dynamic venue universe={len(rows)} | {counts}",
+            f"[GLOBAL] Discovery cycle complete: universe={len(rows)} | {counts}",
             "INFO",
             debounce_key="deep_universe_counts",
             debounce_sec=60,
