@@ -10,7 +10,7 @@ import os
 from collections import defaultdict
 from typing import Dict, Iterable, List
 
-ASSET_CLASSES = ("CRYPTO", "STOCK", "INDEX", "GOLD", "OIL")
+ASSET_CLASSES = ("CRYPTO", "STOCK", "INDEX", "METAL", "GOLD", "OIL", "FOREX", "ENERGY")
 
 STOCKS = set(x.strip().upper() for x in os.getenv("STOCK_SYMBOL_HINTS", "".join([
     "AAPL,AMZN,GOOGL,MSFT,NVDA,META,TSLA,NFLX,AMD,INTC,AVGO,ORCL,CRM,ADBE,",
@@ -22,7 +22,14 @@ INDEX_HINTS = ("US500", "USSTECH", "USTECH", "US30", "DJI", "SPX", "SP500",
                "NASDAQ", "NDX", "DAX", "DE40", "GER40", "FTSE", "UK100", "CAC",
                "FRA40", "NIKKEI", "JP225", "HSI", "HK50", "AUS200", "EU50", "STOXX")
 GOLD_HINTS = ("XAU", "GOLD")
-OIL_HINTS = ("OIL", "WTI", "BRENT", "CRUDE")
+METAL_HINTS = ("XAG", "SILVER", "PALLADIUM", "PLATINUM", "NICKEL",
+               "ALUMINIUM", "ALUMINUM", "ZINC", "LEAD", "COPPER")
+OIL_HINTS = ("OIL", "WTI", "BRENT", "CRUDE", "HEATINGOIL", "OILHEATING", "GASOLINE")
+ENERGY_HINTS = ("NATURALGAS", "NATGAS",
+                "COFFEE", "COCOA", "SOYBEAN", "SOYBEANS", "SUGAR", "WHEAT", "CORN",
+                "GASOLINE", "COAL")
+FOREX_HINTS = ("EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "SEK", "NOK",
+               "PLN", "MXN", "ZAR", "TRY", "CNH", "HKD", "SGD", "THB", "DKK")
 
 
 def _text(symbol: str, market: dict) -> str:
@@ -38,14 +45,25 @@ def _text(symbol: str, market: dict) -> str:
 def classify(symbol: str, market: dict) -> str:
     text = _text(symbol, market)
     base = str(market.get("base", symbol)).upper().split("/")[0].replace("-USDT", "")
+    # Metals and Gold are detected before FOREX so XAU-crosses become
+    # correctly classified; pure FX pairs remain FOREX.
     if any(h in text for h in GOLD_HINTS):
         return "GOLD"
-    if any(h in text for h in OIL_HINTS):
-        return "OIL"
+    if any(h in text for h in METAL_HINTS):
+        return "METAL"
     if any(h in text for h in INDEX_HINTS):
         return "INDEX"
+    if any(h in text for h in OIL_HINTS):
+        return "OIL"
+    if any(h in text for h in ENERGY_HINTS):
+        return "ENERGY"
     if base in STOCKS or any(k in text for k in ("STOCK", "EQUITY", "SHARE")):
         return "STOCK"
+    # pure FOREX: NCCO venue uses <BASE><CURRENCY>2USD style
+    fore_hits = [h for h in FOREX_HINTS if h in base]
+    if fore_hits and ("NCCO" in base or (base.endswith(("AUD","EUR","CHF","GBP","JPY","CAD","NZD"))
+                                         and "USDT" not in str(symbol).upper())):
+        return "FOREX"
     return "CRYPTO"
 
 

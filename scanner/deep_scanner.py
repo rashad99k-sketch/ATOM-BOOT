@@ -16,7 +16,7 @@ from typing import Callable, Dict, List, Optional
 import core.engine as E
 from news.service import NewsService, news_state_for_side
 from strategy.engine import StrategyEngine
-from scanner.universe import build_balanced
+from scanner.universe import build_balanced, classify
 
 # MSB-OB is a hard dependency of this module; isolation-safe import keeps
 # teardown-order flakiness from previous test sessions from killing the
@@ -151,20 +151,27 @@ class DeepScanner:
         self._publish_status()
         E.MEMORY["deep_universe_counts"] = counts
         E.MEMORY["deep_universe_size"] = len(rows)
-        classes = self.ASSET_CLASSES
-        missing = [c for c in classes if c not in counts]
-        if missing:
-            # explicit per-class no-setup marker per requirement
-            E.log_execution(f"[GLOBAL] {missing[0]}: NO_QUALIFIED_SETUP",
+        classes_needed = ("CRYPTO", "STOCK", "INDEX", "METAL", "GOLD", "OIL", "ENERGY", "FOREX")
+        for cls in classes_needed:
+            n = counts.get(cls, 0)
+            E.log_execution(f"[GLOBAL] {cls} discovered={n}",
                             "INFO",
-                            debounce_key=f"deep_missing_{missing[0]}",
+                            debounce_key=f"global_disc_{cls}",
                             debounce_sec=60)
-        E.log_execution(
-            f"[GLOBAL] Discovery cycle complete: universe={len(rows)} | {counts}",
-            "INFO",
-            debounce_key="deep_universe_counts",
-            debounce_sec=60,
-        )
+            if n == 0:
+                reason = "NO_QUALIFIED_SETUP"
+                try:
+                    possible = sum(1 for sym, m in markets.items()
+                                   if classify(sym, m) == cls and
+                                   str(m.get("type", "")).lower() in {"swap", "future"})
+                    if possible == 0:
+                        reason = "NO_SUPPORTED_LIQUIDITY"
+                except Exception:
+                    pass
+                E.log_execution(f"[GLOBAL] {cls}: {reason}",
+                                "INFO",
+                                debounce_key=f"global_missing_{cls}",
+                                debounce_sec=60)
         return rows
 
     @staticmethod
