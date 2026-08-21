@@ -1049,6 +1049,93 @@ class CrossAssetDiscoveryTest(unittest.TestCase):
         self.assertTrue({"CRYPTO", "STOCK", "INDEX", "GOLD", "OIL"} & allowed)
 
 
+class TradFiStockDiscoveryTest(unittest.TestCase):
+    """Real stock discovery, classification hardening, news entity and market
+    status. Tests use canonical prefix metadata, never hardcoded fake stocks."""
+
+    @staticmethod
+    def _m(symbol_prefix, info_extra=None, mtype="swap"):
+        base = f"{symbol_prefix}2USD"
+        info = {"displayName": symbol_prefix, "apiStateOpen": "true",
+                "apiStateClose": "true", "status": 1}
+        if info_extra:
+            info.update(info_extra)
+        return {"base": base, "type": mtype, "info": info}
+
+    # A. Real stock discovery (metadata)
+    def test_real_stocks_discoverable(self):
+        from scanner.universe import classify
+        for s in ("NCSKAAPL2USD/USDT:USDT", "NCSKNVDA2USD/USDT:USDT",
+                  "NCSKMSTR2USD/USDT:USDT", "NCSKASML2USD/USDT:USDT"):
+            m = {"type": "swap", "base": s.split("/")[0].replace("-USDT", ""),
+                 "info": {"displayName": s, "apiStateOpen": "true", "apiStateClose": "true", "status": 1}}
+            cls, src, conf = classify(s, m)
+            self.assertEqual(cls, "STOCK")
+            self.assertEqual(src, "metadata")
+            self.assertEqual(conf, 1.0)
+
+    # B. Classification across all classes
+    def test_classification_all_classes(self):
+        from scanner.universe import classify
+        cases = [
+            ("NCSKAAPL2USD/USDT:USDT", "STOCK"),
+            ("NCSINASDAQ1002USD/USDT:USDT", "INDEX"),
+            ("NCCOGOLD2USD/USDT:USDT", "GOLD"),
+            ("NCCO1OILBRENT2USD/USDT:USDT", "OIL"),
+            ("NCCOXAG2USD/USDT:USDT", "METAL"),
+            ("NCCOCOFFEE2USD/USDT:USDT", "ENERGY"),
+            ("BTC/USDT:USDT", "CRYPTO"),
+        ]
+        for sym, expected in cases:
+            cls, src, conf = classify(sym, {"type": "swap", "base": sym.split("/")[0].replace("-USDT", ""), "info": {"displayName": sym}})
+            self.assertEqual(cls, expected, sym)
+
+    # C. Negative: FOREX must NOT become GOLD; NCCO commodity must NOT become GOLD
+    def test_forex_not_gold(self):
+        from scanner.universe import classify
+        cls, _, _ = classify("NCCOEUR2USD/USD:USD", {"base": "NCCOEUR", "info": {"name": "EURUSD"}})
+        self.assertEqual(cls, "FOREX")
+        cls2, _, _ = classify("NCCO1OILBRENT2USD/USDT:USDT", {"base": "NCCO1OILBRENT", "info": {"name": "BRENT OIL"}})
+        self.assertEqual(cls2, "OIL")
+
+    # D. News mapping (entity aliases from canonical symbol)
+    def test_news_entity_mapping(self):
+        from scanner.universe import canonical_symbol
+        self.assertEqual(canonical_symbol("NCSKAAPL2USD/USDT:USDT"), "AAPL")
+        self.assertEqual(canonical_symbol("NCSKNVDA2USD/USDT:USDT"), "NVDA")
+        self.assertEqual(canonical_symbol("NCSINASDAQ1002USD/USDT:USDT"), "NASDAQ100")
+        self.assertEqual(canonical_symbol("NCCOGOLD2USD/USDT:USDT"), "GOLD")
+
+    # F. Market status helper
+    def test_market_status_open(self):
+        from scanner.universe import market_status
+        s = market_status({"info": {"apiStateOpen": "true", "apiStateClose": "true", "status": 1}})
+        self.assertEqual(s["market_status"], "24_7")
+        self.assertEqual(s["source"], "VENUE")
+        self.assertTrue(s["execution_available"])
+
+    def test_market_status_closed(self):
+        from scanner.universe import market_status
+        s = market_status({"info": {"apiStateOpen": "false", "apiStateClose": "true", "status": 1}})
+        self.assertEqual(s["market_status"], "CLOSED")
+        self.assertFalse(s["execution_available"])
+
+    def test_market_status_unknown(self):
+        from scanner.universe import market_status
+        self.assertEqual(market_status({"info": {}})["market_status"], "UNKNOWN")
+        self.assertEqual(market_status({"info": {}})["source"], "FALLBACK")
+
+    # H. Allocator compatibility: STOCK candidate reaches allocator
+    def test_allocator_accepts_stock_class(self):
+        from portfolio.manager import PortfolioManager
+        from portfolio.allocator import GlobalAssetAllocator
+        m = PortfolioManager(6, None)
+        a = GlobalAssetAllocator(m, E)
+        r = a.allocate([{"symbol": "NCSKAAPL2USD/USDT:USDT", "asset_class": "STOCK",
+                         "side": "BUY", "priority_score": 70.0}], limit=6)
+        self.assertTrue(r.decisions[0].allowed)
+
+
 class QueuePromotionsPayloadTest(unittest.TestCase):
     """Watchlist→queue promotion count must be visible in the dashboard payload."""
 

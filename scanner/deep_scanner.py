@@ -162,7 +162,7 @@ class DeepScanner:
                 reason = "NO_QUALIFIED_SETUP"
                 try:
                     possible = sum(1 for sym, m in markets.items()
-                                   if classify(sym, m) == cls and
+                                   if classify(sym, m)[0] == cls and
                                    str(m.get("type", "")).lower() in {"swap", "future"})
                     if possible == 0:
                         reason = "NO_SUPPORTED_LIQUIDITY"

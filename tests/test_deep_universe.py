@@ -1,6 +1,6 @@
 import os
 import unittest
-from scanner.universe import classify, build_balanced
+from scanner.universe import classify_legacy as classify, build_balanced
 
 class DeepUniverseTest(unittest.TestCase):
     def test_asset_classification(self):
