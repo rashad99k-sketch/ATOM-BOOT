@@ -52,6 +52,8 @@ def _install_stubs():
     msb_mod.STATUS_MITIGATING = "MITIGATING"
     msb_mod.STATUS_INVALIDATED = "INVALIDATED"
     msb_mod.STATUS_EXPIRED = "EXPIRED"
+    msb_mod.msb_context = lambda *a, **k: None
+    msb_mod.rank_zones = lambda zones, side: (None, None)
     core_mod.__path__ = [""]
     sys.modules["core"] = core_mod
     sys.modules["core.engine"] = engine

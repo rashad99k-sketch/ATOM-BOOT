@@ -291,3 +291,267 @@ def analyze_msb(df, symbol="UNKNOWN", zigzag_len=DEFAULT_ZIGZAG_LEN,
                 fib_factor=DEFAULT_FIB_FACTOR, max_zones=5) -> Dict:
     """Convenience wrapper matching the existing engine style."""
     return MSBOBEngine(int(zigzag_len), float(fib_factor), max_zones).analyze(df, symbol)
+
+
+# ---------------------------------------------------------------------------
+# Institutional context assembly
+# ---------------------------------------------------------------------------
+
+LIQ_NONE = "NO_LIQUIDITY_EVENT"
+LIQ_NEARBY = "LIQUIDITY_NEARBY"
+LIQ_SWEPT = "LIQUIDITY_SWEPT"
+LIQ_CONFIRMED = "LIQUIDITY_SWEEP_CONFIRMED"
+LIQ_CONFLICT = "LIQUIDITY_CONFLICT"
+
+
+@dataclass
+class MSBInstitutionalContext:
+    """Canonical explainable context for the single primary zone."""
+
+    symbol: str
+    side: int
+    msb_direction: int
+    msb_price: float
+    zone_id: str
+    zone_type: str
+    zone_top: float
+    zone_bottom: float
+    zone_status: str
+    created_at: int
+    msb_event_id: str
+
+    liquidity_side: str
+    liquidity_swept: bool
+    liquidity_price: float
+    liquidity_distance: float   # ATRs between price and pool level
+    sweep_recency: int          # bar-age of sweep; -1 if none
+    sweep_before_msb: bool      # whether sweep happened BEFORE the structural break
+
+    displacement_detected: bool
+    displacement_score: float
+
+    bos: bool
+    choch: bool
+    mss: bool
+
+    rejection_detected: bool
+    absorption_detected: bool
+
+    volume_confirmation: bool
+    flow_confirmation: bool
+
+    existing_zone_strength: float
+    existing_ob_quality: float
+    zone_freshness: int
+    zone_touch_count: int
+
+    institutional_intent: float
+    institutional_behaviour: str
+
+    trend_alignment: float
+    news_state: str
+
+    context_confidence: float
+
+    def to_dict(self) -> dict:
+        return {
+            "symbol": self.symbol,
+            "side": "LONG" if self.side == LONG else "SHORT",
+            "msb_direction": "BULL" if self.msb_direction == LONG else "BEAR",
+            "msb_price": self.msb_price,
+            "zone_id": self.zone_id,
+            "zone_type": self.zone_type,
+            "zone_top": self.zone_top,
+            "zone_bottom": self.zone_bottom,
+            "zone_status": self.zone_status,
+            "created_at": self.created_at,
+            "msb_event_id": self.msb_event_id,
+            "liquidity_side": self.liquidity_side,
+            "liquidity_swept": self.liquidity_swept,
+            "liquidity_price": self.liquidity_price,
+            "liquidity_distance": self.liquidity_distance,
+            "sweep_recency": self.sweep_recency,
+            "sweep_before_msb": self.sweep_before_msb,
+            "displacement_detected": self.displacement_detected,
+            "displacement_score": self.displacement_score,
+            "bos": self.bos, "choch": self.choch, "mss": self.mss,
+            "rejection_detected": self.rejection_detected,
+            "absorption_detected": self.absorption_detected,
+            "volume_confirmation": self.volume_confirmation,
+            "flow_confirmation": self.flow_confirmation,
+            "existing_zone_strength": self.existing_zone_strength,
+            "existing_ob_quality": self.existing_ob_quality,
+            "zone_freshness": self.zone_freshness,
+            "zone_touch_count": self.zone_touch_count,
+            "institutional_intent": self.institutional_intent,
+            "institutional_behaviour": self.institutional_behaviour,
+            "trend_alignment": self.trend_alignment,
+            "news_state": self.news_state,
+            "context_confidence": self.context_confidence,
+        }
+
+
+def msb_context(df, symbol: str, side: int, queue_engine, *,
+                zone: Optional[dict] = None,
+                msb_event: Optional[dict] = None,
+                news_state: str = "NEWS_UNAVAILABLE",
+                atr: float = 0.0) -> Optional[MSBInstitutionalContext]:
+    """Build the canonical context object for a candidate.
+
+    Consumes existing queue-engine evaluators (liquidity/structure/OB/trend)
+    and the provided zone. No score is added; context_confidence is a
+    transparency value for explainability, not a scoring term.
+    """
+    if df is None or atr <= 0 or zone is None:
+        return None
+    try:
+        price = float(df["close"].iloc[-1])
+    except Exception:
+        return None
+
+    eng = queue_engine
+    liq_score, liq_ev = eng._evaluate_liquidity(df, "BUY" if side == LONG else "SELL", atr)
+    liq_state = liq_ev.get("state", LIQ_NONE)
+    sweep_age = liq_ev.get("sweep_age")
+    liq_price = float(liq_ev.get("level", 0.0))
+    liq_distance = float(liq_ev.get("distance_atr", 0.0))
+    liquidity_swept = liq_ev.get("sweep", 0) >= 100
+
+    pool = eng._build_liquidity_pools(df)
+    eq_highs, eq_lows = eng._detect_equal_highs_lows(df)
+    if side == LONG:
+        liq_side = "SELL_SIDE"  # sell-side liquidity is the target for a long setup
+        liq_nearby = bool(pool.get("low_pools")) or eq_lows
+    else:
+        liq_side = "BUY_SIDE"
+        liq_nearby = bool(pool.get("high_pools")) or eq_highs
+
+    struct_score, struct_type = eng._evaluate_structure(df, "BUY" if side == LONG else "SELL")
+    bos = getattr(struct_type, "value", None) == "BOS"
+    mss = getattr(struct_type, "value", None) == "MSS"
+    choch = False  # CHoCH is currently folded into struct_shift; not separately exposed
+
+    try:
+        ob_score, _ = eng._evaluate_order_block(df, "BUY" if side == LONG else "SELL", atr)
+    except Exception:
+        ob_score = 0.0
+    try:
+        trend_score = eng._evaluate_trend_alignment(df, "BUY" if side == LONG else "SELL")
+    except Exception:
+        trend_score = 50.0
+    try:
+        inst_score = eng._evaluate_institutional(df, "BUY" if side == LONG else "SELL")
+    except Exception:
+        inst_score = 50.0
+
+    # Volume confirmation: existing volume context in smart-money flow
+    try:
+        smart = eng.SmartMoneyEngine.analyze_smart_money(df)
+        vol_confirm = bool(smart.get("smart_money_dominant", False))
+        flow_confirm = (side == LONG and smart.get("institutional_bias") == "BUY") or \
+                       (side == SHORT and smart.get("institutional_bias") == "SELL")
+    except Exception:
+        vol_confirm = False
+        flow_confirm = False
+
+    last = df.iloc[-1]
+    rejected = (float(last["close"]) > float(last["open"])) if side == LONG \
+               else (float(last["close"]) < float(last["open"]))
+    absorb = bool(liq_ev.get("absorption", 0) >= 70)
+    disp_score = float(liq_ev.get("displacement", 0))
+
+    # Temporal check: the sweep's bar position vs the MSB event's bar position
+    sweep_before_msb = False
+    if msb_event is not None and sweep_age is not None:
+        msb_idx = int(msb_event.get("index", 0))
+        n = len(df)
+        sweep_bar = n - 1 - int(sweep_age)
+        sweep_before_msb = sweep_bar <= msb_idx
+
+    # Map into explicit liquidity context states
+    if liq_state in ("LIQUIDITY_SWEPT",) and sweep_before_msb:
+        context_state = LIQ_CONFIRMED
+    elif liquidity_swept:
+        context_state = LIQ_SWEPT
+    elif liq_nearby:
+        context_state = LIQ_NEARBY
+    else:
+        context_state = LIQ_NONE
+
+    zone_status = str(zone.get("status", "ACTIVE"))
+    confidence = 0.0
+    if context_state == LIQ_CONFIRMED:
+        confidence += 0.30
+    elif context_state == LIQ_SWEPT:
+        confidence += 0.18
+    elif context_state == LIQ_NEARBY:
+        confidence += 0.08
+    confidence += 0.20 if disp_score >= 40 else 0.10 if disp_score > 0 else 0.0
+    confidence += 0.15 if (bos or mss) else 0.0
+    confidence += 0.10 if rejected else 0.0
+    confidence += 0.10 if absorb else 0.0
+    confidence += 0.10 if vol_confirm else 0.0
+    confidence += 0.10 if flow_confirm else 0.0
+    confidence += 0.05 if ob_score >= 65 else 0.0
+    confidence += 0.05 if trend_score >= 65 else 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    zone_id = f"{symbol}:{zone.get('side', side)}:{zone.get('zone_type','?')}:{zone.get('created_at',0)}"
+    msb_event_id = (f"{symbol}:MSB:{msb_event.get('direction','?')}:{msb_event.get('index',0)}"
+                    if msb_event else f"{symbol}:MSB:NONE:0")
+
+    return MSBInstitutionalContext(
+        symbol=symbol, side=side, msb_direction=side,
+        msb_price=float(msb_event.get("price", 0.0)) if msb_event else 0.0,
+        zone_id=zone_id,
+        zone_type=str(zone.get("zone_type", "OB")),
+        zone_top=float(zone.get("top", 0.0)),
+        zone_bottom=float(zone.get("bottom", 0.0)),
+        zone_status=zone_status,
+        created_at=int(zone.get("created_at", 0)),
+        msb_event_id=msb_event_id,
+        liquidity_side=liq_side,
+        liquidity_swept=liquidity_swept,
+        liquidity_price=liq_price,
+        liquidity_distance=liq_distance,
+        sweep_recency=int(sweep_age) if sweep_age is not None else -1,
+        sweep_before_msb=sweep_before_msb,
+        displacement_detected=disp_score > 0,
+        displacement_score=disp_score,
+        bos=bos, choch=choch, mss=mss,
+        rejection_detected=rejected,
+        absorption_detected=absorb,
+        volume_confirmation=vol_confirm,
+        flow_confirmation=flow_confirm,
+        existing_zone_strength=float(liq_ev.get("composite", liq_score)),
+        existing_ob_quality=float(ob_score),
+        zone_freshness=int(zone.get("freshness", 0)),
+        zone_touch_count=int(zone.get("touch_count", 0)),
+        institutional_intent=float(inst_score),
+        institutional_behaviour="INFERRED",
+        trend_alignment=float(trend_score),
+        news_state=str(news_state),
+        context_confidence=round(confidence, 3),
+    )
+
+
+def rank_zones(zones: List[dict], side: int) -> Tuple[Optional[dict], Optional[dict]]:
+    """Deterministically rank side-matched zones.
+
+    Existing-zone-quality rule order: ACTIVE > TOUCHED > MITIGATING, then
+    zone_strength, then smallest freshness, then highest touch_count.
+    INVALIDATED/EXPIRED zones are excluded. Returns (primary, secondary).
+    """
+    usable = [z for z in zones
+              if str(z.get("side", "")) in (("LONG" if side == LONG else "SHORT"),)
+              and z.get("status") in (STATUS_ACTIVE, STATUS_TOUCHED, STATUS_MITIGATING)]
+    usable.sort(key=lambda z: (
+        0 if z.get("status") == STATUS_ACTIVE else (1 if z.get("status") == STATUS_TOUCHED else 2),
+        -float(z.get("zone_strength", 0.0)),
+        int(z.get("freshness", 0)),
+        -int(z.get("touch_count", 0)),
+        -float(z.get("top", 0.0)) - float(z.get("bottom", 0.0)),
+    ))
+    primary = usable[0] if usable else None
+    secondary = usable[1] if len(usable) > 1 else None
+    return primary, secondary

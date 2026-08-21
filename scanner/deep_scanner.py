@@ -25,6 +25,7 @@ try:
     from core.msb_ob import (
         LONG, SHORT, STATUS_ACTIVE, STATUS_TOUCHED, STATUS_MITIGATING,
         STATUS_INVALIDATED, STATUS_EXPIRED, analyze_msb,
+        msb_context, rank_zones,
     )
 except Exception:  # pragma: no cover - defensive fallback for stubbed-parent-package sessions
     import importlib as _il
@@ -37,6 +38,8 @@ except Exception:  # pragma: no cover - defensive fallback for stubbed-parent-pa
     STATUS_INVALIDATED = getattr(_msb, "STATUS_INVALIDATED", "INVALIDATED")
     STATUS_EXPIRED = getattr(_msb, "STATUS_EXPIRED", "EXPIRED")
     analyze_msb = getattr(_msb, "analyze_msb")
+    msb_context = getattr(_msb, "msb_context")
+    rank_zones = getattr(_msb, "rank_zones")
 
 
 class DeepScanner:
@@ -579,18 +582,33 @@ class DeepScanner:
 
             msb_payload = {"error": "MSB_UNAVAILABLE", "zones": [], "msb_events": [], "market": None}
             msb_side_active = False
+            msb_ctx = None
+            primary_zone = None
+            secondary_zone = None
+            primary_msb_event = None
             try:
                 msb_result = analyze_msb(df, sym)
                 if not msb_result.get("error"):
                     msb_payload = msb_result
-                    matching_side = LONG if best["side"] == "BUY" else SHORT
-                    for z in msb_result["zones"]:
-                        if z["side"] == ("LONG" if best["side"] == "BUY" else "SHORT") and \
-                           z["status"] in (STATUS_ACTIVE, STATUS_TOUCHED, STATUS_MITIGATING):
-                            msb_side_active = True
-                            break
+                    side_int = LONG if best["side"] == "BUY" else SHORT
+                    primary_zone, secondary_zone = rank_zones(msb_result["zones"], side_int)
+                    msb_side_active = primary_zone is not None
                     if msb_side_active:
                         reasons.append("MSB")
+                    # Locate the MSB event that created the primary zone
+                    if primary_zone is not None:
+                        cz = primary_zone.get("created_at", 0)
+                        for ev in msb_result["msb_events"]:
+                            if int(ev.index) == cz and ev.direction == side_int:
+                                primary_msb_event = {"direction": ev.direction,
+                                                     "price": ev.price,
+                                                     "index": ev.index}
+                                break
+                        if primary_msb_event is None and msb_result["msb_events"]:
+                            ev = msb_result["msb_events"][-1]
+                            primary_msb_event = {"direction": ev.direction,
+                                                 "price": ev.price,
+                                                 "index": ev.index}
             except Exception as exc:
                 # MSB evidence must never break the deep scan; report and continue.
                 self.stats["errors"] += 1
@@ -598,6 +616,37 @@ class DeepScanner:
                     f"[WATCHLIST] {sym} MSB evidence failed: {exc}",
                     "WARN",
                     debounce_key=f"watch_msb_{sym}",
+                    debounce_sec=120,
+                )
+            # Canonical institutional context: replaces the placeholder. Uses
+            # the existing queue engine's evaluators only; no new scoring
+            # dimension and no READY shortcut.
+            try:
+                if primary_zone is not None:
+                    atr_for_ctx = 0.0
+                    try:
+                        atrSeries = E.compute_atr(df)
+                        atr_for_ctx = float(atrSeries.iloc[-1])
+                    except Exception:
+                        atr_for_ctx = 0.0
+                    if atr_for_ctx > 0:
+                        ctx_obj = msb_context(
+                            df, sym, side_int, E.queue,
+                            zone=primary_zone,
+                            msb_event=primary_msb_event,
+                            news_state=news_state_for_side(
+                                news, best["side"], float(os.getenv("NEWS_RISK_BLOCK", "80"))
+                            ),
+                            atr=atr_for_ctx,
+                        )
+                        if ctx_obj is not None:
+                            msb_ctx = ctx_obj.to_dict()
+            except Exception as exc:
+                self.stats["errors"] += 1
+                E.log_execution(
+                    f"[WATCHLIST] {sym} MSB context failed: {exc}",
+                    "WARN",
+                    debounce_key=f"watch_msb_ctx_{sym}",
                     debounce_sec=120,
                 )
 
@@ -636,6 +685,9 @@ class DeepScanner:
                     "zone_status": zone_status,
                     "msb": msb_payload,
                     "msb_active": msb_side_active,
+                    "msb_context": msb_ctx,
+                    "msb_primary_zone": primary_zone,
+                    "msb_secondary_zone": secondary_zone,
                     "orderbook_imbalance": round(ob_imbalance, 4),
                     "fvg": fvg,
                     "deep_analyzed": True,
