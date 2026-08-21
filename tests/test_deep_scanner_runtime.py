@@ -43,8 +43,19 @@ def _install_stubs():
     }
     engine.get_orderbook_cached = lambda *a, **k: {"bids": [[99, 10]], "asks": [[101, 5]]}
     engine.get_ohlcv_safe = lambda *a, **k: _df()
+    msb_mod = types.ModuleType("core.msb_ob")
+    msb_mod.analyze_msb = lambda df, symbol: {"error": "MSB_UNAVAILABLE", "zones": [], "msb_events": [], "market": None}
+    msb_mod.LONG = 1
+    msb_mod.SHORT = -1
+    msb_mod.STATUS_ACTIVE = "ACTIVE"
+    msb_mod.STATUS_TOUCHED = "TOUCHED"
+    msb_mod.STATUS_MITIGATING = "MITIGATING"
+    msb_mod.STATUS_INVALIDATED = "INVALIDATED"
+    msb_mod.STATUS_EXPIRED = "EXPIRED"
+    core_mod.__path__ = [""]
     sys.modules["core"] = core_mod
     sys.modules["core.engine"] = engine
+    sys.modules["core.msb_ob"] = msb_mod
 
     news_mod = types.ModuleType("news.service")
     class FakeNews:
@@ -93,7 +104,7 @@ def _df():
 class DeepScannerRuntimeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._saved = {name: sys.modules.get(name) for name in ("core", "core.engine", "news.service", "strategy.engine", "scanner.deep_scanner")}
+        cls._saved = {name: sys.modules.get(name) for name in ("core", "core.engine", "core.msb_ob", "news.service", "strategy.engine", "scanner.deep_scanner")}
         _install_stubs()
         # Reload the scanner after dependency stubs are installed so test order
         # cannot leak a previously imported production module.
@@ -109,6 +120,7 @@ class DeepScannerRuntimeTest(unittest.TestCase):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+        sys.modules.pop("core.msb_ob", None)
 
     def test_radar_does_not_zero_out_when_radar_symbols_is_unset(self):
         scanner = self.DeepScanner(max_symbols=5)

@@ -18,6 +18,26 @@ from news.service import NewsService, news_state_for_side
 from strategy.engine import StrategyEngine
 from scanner.universe import build_balanced
 
+# MSB-OB is a hard dependency of this module; isolation-safe import keeps
+# teardown-order flakiness from previous test sessions from killing the
+# deep-scanner module entirely.
+try:
+    from core.msb_ob import (
+        LONG, SHORT, STATUS_ACTIVE, STATUS_TOUCHED, STATUS_MITIGATING,
+        STATUS_INVALIDATED, STATUS_EXPIRED, analyze_msb,
+    )
+except Exception:  # pragma: no cover - defensive fallback for stubbed-parent-package sessions
+    import importlib as _il
+    _msb = _il.import_module("core.msb_ob")
+    LONG = getattr(_msb, "LONG", 1)
+    SHORT = getattr(_msb, "SHORT", -1)
+    STATUS_ACTIVE = getattr(_msb, "STATUS_ACTIVE", "ACTIVE")
+    STATUS_TOUCHED = getattr(_msb, "STATUS_TOUCHED", "TOUCHED")
+    STATUS_MITIGATING = getattr(_msb, "STATUS_MITIGATING", "MITIGATING")
+    STATUS_INVALIDATED = getattr(_msb, "STATUS_INVALIDATED", "INVALIDATED")
+    STATUS_EXPIRED = getattr(_msb, "STATUS_EXPIRED", "EXPIRED")
+    analyze_msb = getattr(_msb, "analyze_msb")
+
 
 class DeepScanner:
     ASSET_CLASSES = ("CRYPTO", "GOLD", "OIL", "INDEX", "STOCK")
@@ -557,6 +577,30 @@ class DeepScanner:
                     debounce_sec=300,
                 )
 
+            msb_payload = {"error": "MSB_UNAVAILABLE", "zones": [], "msb_events": [], "market": None}
+            msb_side_active = False
+            try:
+                msb_result = analyze_msb(df, sym)
+                if not msb_result.get("error"):
+                    msb_payload = msb_result
+                    matching_side = LONG if best["side"] == "BUY" else SHORT
+                    for z in msb_result["zones"]:
+                        if z["side"] == ("LONG" if best["side"] == "BUY" else "SHORT") and \
+                           z["status"] in (STATUS_ACTIVE, STATUS_TOUCHED, STATUS_MITIGATING):
+                            msb_side_active = True
+                            break
+                    if msb_side_active:
+                        reasons.append("MSB")
+            except Exception as exc:
+                # MSB evidence must never break the deep scan; report and continue.
+                self.stats["errors"] += 1
+                E.log_execution(
+                    f"[WATCHLIST] {sym} MSB evidence failed: {exc}",
+                    "WARN",
+                    debounce_key=f"watch_msb_{sym}",
+                    debounce_sec=120,
+                )
+
             entry.update(
                 {
                     "side": best["side"],
@@ -590,6 +634,8 @@ class DeepScanner:
                     ),
                     "zone": zone_payload,
                     "zone_status": zone_status,
+                    "msb": msb_payload,
+                    "msb_active": msb_side_active,
                     "orderbook_imbalance": round(ob_imbalance, 4),
                     "fvg": fvg,
                     "deep_analyzed": True,

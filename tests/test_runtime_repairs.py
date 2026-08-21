@@ -470,6 +470,87 @@ class LiquidityIntelligenceTest(unittest.TestCase):
         self.assertLess(ev["data_conf"], 100)
 
 
+class MSBOBEngineTest(unittest.TestCase):
+    """MSB-OB structural evidence engine: parity targets against the Pine
+    semantics, closed-candle determinism, and zone lifecycle rules."""
+
+    @staticmethod
+    def _mk(x, vol=1000.0):
+        n = len(x)
+        return pd.DataFrame({
+            "open": x, "high": x + 0.6, "low": x - 0.6,
+            "close": x, "volume": np.full(n, vol),
+        })
+
+    def _break_series(self, amp=2.0):
+        """Mixed bullish/bearish candles so Pine-style zones can form."""
+        t = np.arange(300)
+        x = 100 + amp * np.sin(t / 4.0)
+        x[150:] = np.linspace(x[150], x[150] - 15, 150)
+        o = np.where(np.arange(300) % 2 == 0, x - 0.5, x + 0.5)
+        c = np.where(np.arange(300) % 2 == 0, x + 0.5, x - 0.5)
+        return x, self._mk_from_oc(o, c, x)
+
+    @staticmethod
+    def _mk_from_oc(o, c, x):
+        n = len(x)
+        return pd.DataFrame({
+            "open": o, "high": x + 0.6, "low": x - 0.6,
+            "close": c, "volume": np.full(n, 1000.0),
+        })
+
+    def test_displacement_break_yields_msb_and_zone(self):
+        from core.msb_ob import analyze_msb
+        x, df = self._break_series()
+        r = analyze_msb(df, "TEST")
+        self.assertGreaterEqual(len(r["msb_events"]), 1)
+        self.assertGreaterEqual(len(r["zones"]), 1)
+        self.assertIn("side", r["zones"][0])
+        self.assertIn("top", r["zones"][0])
+        self.assertIn("bottom", r["zones"][0])
+
+    def test_no_break_no_zones(self):
+        from core.msb_ob import analyze_msb, MSBOBEngine
+        # strictly monotone series — every swing just confirms existing trend
+        y = np.linspace(100, 140, 300)
+        o = y - 0.2
+        c = y - 0.4
+        r = MSBOBEngine(zigzag_len=9, fib_factor=0.33).analyze(self._mk_from_oc(o, c, y), "TEST")
+        self.assertEqual(len(r["msb_events"]), 0)
+        self.assertEqual(len(r["zones"]), 0)
+
+    def test_closed_candle_determinism(self):
+        from core.msb_ob import analyze_msb
+        _, df = self._break_series()
+        r1 = analyze_msb(df, "TEST")
+        r2 = analyze_msb(df, "TEST")
+        self.assertEqual(r1, r2)
+
+    def test_zones_capture_fib_factor(self):
+        from core.msb_ob import analyze_msb
+        _, df = self._break_series()
+        r = analyze_msb(df, "TEST", fib_factor=0.5)
+        if r["zones"]:
+            self.assertEqual(r["zones"][0]["fib_factor"], 0.5)
+
+    def test_invalidated_zone_marked(self):
+        from core.msb_ob import analyze_msb
+        _, df = self._break_series()
+        r = analyze_msb(df, "TEST")
+        if not r["zones"]:
+            self.skipTest("no zone formed on this synthetic series")
+        for z in r["zones"]:
+            if z["side"] == "LONG":
+                # a bullish zone below a forced-price break must be invalidated.
+                self.assertEqual(z["status"], "INVALIDATED")
+
+    def test_short_frame_reports_data_unavailable(self):
+        from core.msb_ob import analyze_msb
+        r = analyze_msb(self._mk(np.full(5, 100.0)), "TEST")
+        self.assertEqual(r["error"], "DATA_UNAVAILABLE")
+        self.assertEqual(r["zones"], [])
+
+
 class QueuePromotionsPayloadTest(unittest.TestCase):
     """Watchlist→queue promotion count must be visible in the dashboard payload."""
 
