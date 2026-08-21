@@ -132,13 +132,27 @@ class NewsService:
             "dot": ["polkadot", "dot"],
             "avax": ["avalanche", "avax"],
         }
+        equity_known = {
+            "nvda": ["nvidia", "nvda"],
+            "aapl": ["apple inc", "apple stock", "aapl"],
+            "msft": ["microsoft", "msft"],
+            "googl": ["google", "alphabet", "googl"],
+            "amzn": ["amazon", "amzn"],
+            "meta": ["meta platforms", "facebook", "meta"],
+            "tsla": ["tesla", "tsla"],
+            "spy": ["s&p 500 etf", "spy"],
+            "qqq": ["nasdaq etf", "qqq"],
+        }
         instrument_map = {
             "GOLD": ["gold", "xau", "bullion"],
             "OIL": ["oil", "wti", "brent", "crude", "opec"],
             "INDEX": ["nasdaq", "s&p", "sp500", "dow", "dow jones", "wall street"],
+            "EQUITY": ["equity", "shares", "earnings", "stock"],
             "STOCK": [base] if base else [],
             "CRYPTO": [],
         }
+        for alias in equity_known.get(base, []):
+            aliases.add(alias)
         for alias in crypto_known.get(base, []):
             aliases.add(alias)
         for alias in instrument_map.get(asset_class.upper(), []):

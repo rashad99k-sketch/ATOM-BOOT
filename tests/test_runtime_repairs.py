@@ -880,6 +880,111 @@ class MSBTemporalSequenceTest(unittest.TestCase):
         self.assertEqual(len(created_types), len(r["zones"]))
 
 
+class GlobalAllocatorTest(unittest.TestCase):
+    """Portfolio allocator: dynamic selection, class/direction caps,
+    concentration labels, unused-slot explanations, rotation label."""
+
+    def setUp(self):
+        from portfolio.manager import PortfolioManager
+        from portfolio.allocator import GlobalAssetAllocator
+        self.manager = PortfolioManager(6, None)
+        self.alloc = GlobalAssetAllocator(self.manager, E)
+
+    def _cand(self, sym, cls, side="BUY", score=None):
+        return {"symbol": sym, "side": side, "priority_score": score if score is not None else 10.0,
+                "asset_class": cls}
+
+    def test_ranking_prefers_strong_foreign_class(self):
+        cands = [self._cand("BTC/USDT:USDT", "CRYPTO", score=91.0),
+                 self._cand("ETH/USDT:USDT", "CRYPTO", score=72.0),
+                 self._cand("XAUUSD/USDT:USDT", "GOLD", score=92.0),
+                 self._cand("SOL/USDT:USDT", "CRYPTO", score=70.0),
+                 self._cand("DOGE/USDT:USDT", "CRYPTO", score=65.0),
+                 self._cand("XRP/USDT:USDT", "CRYPTO", score=60.0)]
+        r = self.alloc.allocate(cands, limit=6)
+        self.assertTrue(r.decisions[0].allowed)
+        self.assertEqual(r.decisions[0].symbol, "XAUUSD/USDT:USDT")
+        self.assertFalse(all(d.allowed for d in r.decisions))
+        rejected = [d for d in r.decisions if not d.allowed]
+        self.assertTrue(all(d.asset_class == "CRYPTO" for d in rejected))
+
+    def test_class_cap_enforced(self):
+        cands = [self._cand(f"P{i}/USDT:USDT", "GOLD", score=fl) for i, fl in zip(range(4), (91,90,89,88))]
+        r = self.alloc.allocate(cands, limit=6)
+        gold_ok = [d for d in r.decisions if d.asset_class == "GOLD" and d.allowed]
+        self.assertEqual(len(gold_ok), 1)
+
+    def test_direction_cap_enforced(self):
+        cands = [self._cand(f"P{i}/USDT:USDT", "CRYPTO", side="BUY") for i in range(6)]
+        r = self.alloc.allocate(cands, limit=6)
+        buy_ok = [d for d in r.decisions if d.allowed and d.side == "BUY"]
+        self.assertLessEqual(len(buy_ok), self.alloc.SIDE_CAPS["BUY"])
+
+    def test_unused_slot_reason_when_no_candidates_pass(self):
+        r = self.alloc.allocate([self._cand("A/USDT:USDT", "GOLD", score=70.0)], limit=6)
+        # capacity limit is max_positions=6; only one candidate → 4 unused slots
+        self.assertGreaterEqual(r.unused_slots, 1)
+        self.assertIn("no additional candidates", r.slot_reason)
+
+    def test_concentration_high_when_class_saturates(self):
+        cands = [self._cand(f"B{i}/USDT:USDT", "GOLD") for i in range(5)]
+        r = self.alloc.allocate(cands, limit=6)
+        self.assertEqual(r.concentration, "HIGH")
+
+    def test_rotation_label_reflects_chosen_classes(self):
+        r = self.alloc.allocate([self._cand("G/USDT:USDT", "GOLD"), self._cand("O/USDT:USDT", "OIL")], limit=6)
+        self.assertEqual(r.rotation_regime, "RISK_OFF")
+        r2 = self.alloc.allocate([self._cand("C/USDT:USDT", "CRYPTO")], limit=6)
+        self.assertEqual(r2.rotation_regime, "RISK_ON")
+
+    def test_deterministic_under_same_input(self):
+        cands = [self._cand("A/USDT:USDT", "GOLD", score=90.0),
+                 self._cand("B/USDT:USDT", "CRYPTO", score=80.0)]
+        a = self.alloc.allocate(cands, limit=6).to_dict()
+        b = self.alloc.allocate(cands, limit=6).to_dict()
+        self.assertEqual(a, b)
+
+
+class NewsEntityCrossAssetTest(unittest.TestCase):
+    """Entity aliases expand to equities/metals/energy; unrelated never counts."""
+
+    def test_nvda_has_equity_alias(self):
+        a = E.NewsService("ECO") if False else None
+        from news.service import NewsService
+        ns = NewsService()
+        aliases = ns._entity_aliases("NVDA/USDT:USDT", "EQUITY")
+        self.assertIn("nvda", aliases)
+        self.assertIn("nvidia", aliases)
+
+    def test_xau_has_metal_alias(self):
+        from news.service import NewsService
+        ns = NewsService()
+        aliases = ns._entity_aliases("XAUUSD/USDT:USDT", "GOLD")
+        self.assertIn("gold", aliases)
+        self.assertIn("xau", aliases)
+
+    def test_oil_energy_alias(self):
+        from news.service import NewsService
+        ns = NewsService()
+        aliases = ns._entity_aliases("WTI/USDT:USDT", "OIL")
+        self.assertIn("wti", aliases)
+        self.assertIn("crude", aliases)
+
+    def test_unrelated_company_news_not_direct_for_crypto(self):
+        from news.service import NewsService
+        ns = NewsService()
+        self.assertFalse(ns._is_relevant({"title": "Tesla stock surges",
+                                          "snippet": "Shares of Tsla rose on earnings."},
+                                         ["btc", "eth", "crypto"]))
+
+    def test_direct_earnings_for_equity_counts(self):
+        from news.service import NewsService
+        ns = NewsService()
+        self.assertTrue(ns._is_relevant({"title": "NVDA stock earnings soar",
+                                         "snippet": "Nvidia beat analyst estimates."},
+                                        ["nvda", "nvidia"]))
+
+
 class QueuePromotionsPayloadTest(unittest.TestCase):
     """Watchlist→queue promotion count must be visible in the dashboard payload."""
 

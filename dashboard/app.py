@@ -522,7 +522,16 @@ function updateUI(d) {{
     document.getElementById("portfolioSummary").innerText =
         `${{portfolio.open_positions}} / ${{portfolio.max_positions}} positions | ${{portfolio.capacity}} slots available`;
     const assetClasses = portfolio.asset_classes || {{}};
-    document.getElementById("portfolioClasses").innerText = Object.entries(assetClasses).map(([k,v]) => `${{k}}: ${{v}}`).join(" | ") || "No exposure";
+    const alloc = d.allocation || null;
+    let allocText = Object.entries(assetClasses).map(([k,v]) => `${{k}}: ${{v}}`).join(" | ") || "No exposure";
+    if (alloc) {{
+        allocText += ` | Concentration:<b>${{alloc.concentration||"-"}}</b>`;
+        allocText += ` | Rotation:<b>${{alloc.rotation_regime||"-"}}</b>`;
+        if (alloc.unused_slots > 0) allocText += ` | <span style="color:#e67e22" title="${{alloc.slot_reason}}">Unused slots: ${{alloc.unused_slots}}</span>`;
+        const reject = (alloc.decisions||[]).find(x => !x.allowed);
+        if (reject) allocText += ` | <span style="color:#e67e22" title="${{reject.reason}}">Rejected example: ${{reject.symbol}} (${{reject.reason}})</span>`;
+    }}
+    document.getElementById("portfolioClasses").innerHTML = allocText;
     const positions = d.positions || [];
     document.getElementById("portfolioPositions").innerHTML = positions.length
         ? positions.map(p => {{
@@ -1028,6 +1037,7 @@ def data():
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
             "intent_engine": intent_data,
             "dynamic_trade": dynamic_trade_data,
+            "allocation": MEMORY.get("portfolio_allocation", None),
             **live_data
         }
         # Add queue status

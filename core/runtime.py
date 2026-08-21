@@ -10,6 +10,7 @@ import requests
 import core.engine as E
 import scanner.scanner as S
 from portfolio.manager import PortfolioManager
+from portfolio.allocator import GlobalAssetAllocator
 from scanner.deep_scanner import DeepScanner
 
 # Compatibility exports: legacy modules still call these names through E.
@@ -18,6 +19,7 @@ globals().update({k: v for k, v in vars(S).items() if not k.startswith("__")})
 
 MAX_OPEN_POSITIONS = max(1, int(os.getenv("MAX_OPEN_POSITIONS", "6")))
 PORTFOLIO = PortfolioManager(MAX_OPEN_POSITIONS, E)
+ALLOCATOR = GlobalAssetAllocator(PORTFOLIO, E)
 DEEP_SCANNER = DeepScanner()
 
 
@@ -196,6 +198,16 @@ def _service_watchlist_and_queue():
 
     MEMORY["queue_status"] = queue.get_status() if USE_EXECUTION_QUEUE else {}
 
+    # Continuously evaluate global allocation over the current queue snapshot
+    # (read-only publication; the actual gate still only fires on READY).
+    try:
+        if USE_EXECUTION_QUEUE:
+            queue_snapshot = [c.to_dict() for c in queue._candidates.values()]
+            report = ALLOCATOR.allocate(queue_snapshot, limit=PORTFOLIO.max_positions)
+            MEMORY["portfolio_allocation"] = report.to_dict()
+    except Exception as exc:
+        log_execution(f"[PORTFOLIO] allocation evaluation failed: {exc}", "WARN")
+
 def _execute_ready_queue_candidate():
     """Execute only a READY queue candidate through PortfolioManager.
 
@@ -252,6 +264,24 @@ def _execute_ready_queue_candidate():
             "news": watch.get("news", {}) if isinstance(watch, dict) else {},
         }
 
+        # Global portfolio-allocator gate: rejects when class/direction caps
+        # would be violated, and records the reason for dashboard explain.
+        queue_snapshot = [c.to_dict() for c in queue._candidates.values()]
+        alloc_report = ALLOCATOR.allocate(queue_snapshot + [candidate], limit=PORTFOLIO.max_positions)
+        for decision in alloc_report.decisions:
+            if decision.symbol == candidate["symbol"]:
+                if not decision.allowed:
+                    MEMORY["portfolio_allocation"] = alloc_report.to_dict()
+                    log_execution(
+                        f"[PORTFOLIO] {candidate['symbol']} rejected: {decision.reason}",
+                        "INFO",
+                        debounce_key=f"alloc_reject_{candidate['symbol']}",
+                        debounce_sec=60,
+                    )
+                    return False
+                break
+
+        MEMORY["portfolio_allocation"] = alloc_report.to_dict()
         if PORTFOLIO.open_candidate(candidate):
             with queue._lock:
                 if best.symbol in queue._candidates:
