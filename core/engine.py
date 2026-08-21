@@ -5787,6 +5787,7 @@ class ZoneMetrics:
     trend_alignment: float = 50.0
     risk_score: float = 50.0
     trigger_state: str = "WAITING_TRIGGER"
+    liquidity_evidence: dict = field(default_factory=dict)
 
     @property
     def final_zone_score(self) -> float:
@@ -5848,6 +5849,8 @@ class ExecutionCandidate:
             'ob_score': self.zone_metrics.order_block_quality,
             'zone_strength': self.zone_metrics.zone_strength,
             'liquidity': self.zone_metrics.liquidity_quality,
+            'liquidity_state': self.zone_metrics.liquidity_evidence.get('state', 'LIQUIDITY_UNAVAILABLE'),
+            'liquidity_evidence': self.zone_metrics.liquidity_evidence,
             'institutional': self.zone_metrics.institutional_confidence,
             'structure': self.zone_metrics.structure_alignment,
             'timing': self.zone_metrics.entry_timing,
@@ -5921,7 +5924,7 @@ class ExecutionQueue:
                 # Evaluate dimensions
                 ob_score, ob_type = self._evaluate_order_block(df, cand.side, atr)
                 zone_score = self._evaluate_zone_strength(df, cand.side, atr, cand.entry_price)
-                liq_score = self._evaluate_liquidity(df, cand.side, atr)
+                liq_score, liq_evidence = self._evaluate_liquidity(df, cand.side, atr)
                 inst_score = self._evaluate_institutional(df, cand.side)
                 struct_score, struct_type = self._evaluate_structure(df, cand.side)
                 timing_score = self._evaluate_timing(df, cand.side, atr, current_price, cand.entry_price)
@@ -5942,6 +5945,7 @@ class ExecutionQueue:
                     order_block_quality=ob_score,
                     zone_strength=zone_score,
                     liquidity_quality=liq_score,
+                    liquidity_evidence=liq_evidence,
                     institutional_confidence=inst_score,
                     structure_alignment=struct_score,
                     entry_timing=timing_score,
@@ -6129,22 +6133,93 @@ class ExecutionQueue:
 
         return min(100, max(0, score))
 
-    def _evaluate_liquidity(self, df, side, atr):
-        pools = self._build_liquidity_pools(df)
-        swept_high, swept_low = self._detect_sweep(df, pools)
-        stop_hunt, hunt_side = self._detect_stop_hunt(df)
-        eq_highs, eq_lows = self._detect_equal_highs_lows(df)
+    def _absorption_evidence(self, df, side, sweep_j):
+        if sweep_j is None or len(df) < sweep_j + 4 or 'volume' not in df.columns:
+            return {"score": 0, "detected": False}
+        trail = df.iloc[sweep_j+1:sweep_j+4]
+        vols = trail['volume'] if 'volume' in df else None
+        mean_vol = float(vols.mean()) if vols is not None else 0.0
+        repeater = []
+        for _, c in trail.iterrows():
+            if side == "BUY" and float(c['close']) > float(c['open']):
+                repeater.append(True)
+            elif side == "SELL" and float(c['close']) < float(c['open']):
+                repeater.append(True)
+        absorbed = all(repeater) and len(repeater) > 0
+        score = 70 if absorbed else 20
+        return {"score": score, "detected": bool(absorbed)}
 
-        score = 50
+    def _evaluate_liquidity(self, df, side, atr):
+        """Evidence-breakdown liquidity evaluator.
+
+        Returns (composite 0-100, evidence dict). Missing frame/ATR ->
+        LIQUIDITY_UNAVAILABLE; no pools -> LIQUIDITY_INVALID; pool present ->
+        pool/proximity composite; sweep found -> swept state with
+        displacement/structure/absorption/rejection folding in.
+        """
+        if df is None or atr is None or not hasattr(df, "columns"):
+            return 50.0, {"state": "LIQUIDITY_UNAVAILABLE", "pool": 0, "proximity": 0,
+                          "sweep": 0, "sweep_age": None, "displacement": 0,
+                          "rejection": 0, "structure": 0, "absorption": 0,
+                          "data_conf": 0, "composite": 50.0}
+        pools = self._build_liquidity_pools(df)
+        price = float(df['close'].iloc[-1]) if len(df) else 0.0
+        key = 'low_pools' if side == "BUY" else 'high_pools'
+        pool_list = pools.get(key, []) if isinstance(pools, dict) else []
+        if not pool_list:
+            return 30.0, {"state": "LIQUIDITY_INVALID", "pool": 0, "proximity": 0,
+                          "sweep": 0, "sweep_age": None, "displacement": 0,
+                          "rejection": 0, "structure": 0, "absorption": 0,
+                          "data_conf": 0, "composite": 30.0}
+        best = min(pool_list, key=lambda p: abs(price - p[1]))
+        level = float(best[1])
+        data_conf = 100 if ('volume' in df and len(df) >= 50) else (60 if len(df) >= 30 else 30)
+        distance_atr = abs(price - level) / atr if atr > 0 else float('inf')
+        proximity_score = int(max(0, min(100, 100 - (distance_atr * 50 if atr > 0 else 100))))
+        eq_highs, eq_lows = self._detect_equal_highs_lows(df)
+        is_equal = eq_lows if side == "BUY" else eq_highs
+        pool_strength = 45 + (25 if is_equal else 0) + (20 if data_conf == 100 else 10 if data_conf >= 60 else 0)
+        evidence = {"pool": pool_strength, "proximity": proximity_score,
+                    "sweep": 0, "sweep_age": None, "displacement": 0,
+                    "rejection": 0, "structure": 0, "absorption": 0,
+                    "data_conf": data_conf, "level": level, "distance_atr": float(distance_atr)}
+
+        swept_high_age, swept_low_age = self._detect_sweep(df, pools)
+        sweep_age = swept_low_age if side == "BUY" else swept_high_age
+        if sweep_age is None:
+            evidence["state"] = "LIQUIDITY_NEAR" if proximity_score >= 60 else "LIQUIDITY_PRESENT"
+            evidence["composite"] = float(pool_strength * 0.6 + proximity_score * 0.4)
+            return float(max(0, min(100, evidence["composite"]))), evidence
+
+        last = df.iloc[-1]
+        rejected = (float(last['close']) > float(last['open'])) if side == "BUY" \
+                   else (float(last['close']) < float(last['open']))
+        j = min(len(df) - 1 - sweep_age, len(df) - 1)
+        try:
+            struct_score = self._evaluate_structure(df, side)[0]
+        except Exception:
+            struct_score = 0
         if side == "BUY":
-            if swept_low: score += 25
-            if eq_lows: score += 10
-            if stop_hunt and hunt_side == "BUY": score += 20
+            disp_move = float(last['close']) - float(df['low'].iloc[j])
         else:
-            if swept_high: score += 25
-            if eq_highs: score += 10
-            if stop_hunt and hunt_side == "SELL": score += 20
-        return min(100, max(0, score))
+            disp_move = float(df['high'].iloc[j]) - float(last['close'])
+        disp_atr = float(disp_move / atr) if atr > 0 else 0.0
+        evidence.update({
+            "sweep": 100,
+            "sweep_age": int(sweep_age),
+            "displacement": int(max(0, min(100, disp_atr * 20))),
+            "rejection": 84 if rejected else 30,
+            "structure": int(struct_score),
+            "absorption": self._absorption_evidence(df, side, j)["score"],
+            "composite": 0.0,
+        })
+        evidence["composite"] = float(
+            evidence["sweep"] * 0.22 + evidence["displacement"] * 0.20 +
+            evidence["structure"] * 0.18 + evidence["absorption"] * 0.12 +
+            evidence["rejection"] * 0.12 + evidence["pool"] * 0.09 +
+            evidence["proximity"] * 0.07)
+        evidence["state"] = "LIQUIDITY_SWEPT" if sweep_age <= 5 else "LIQUIDITY_NEAR"
+        return float(max(0, min(100, evidence["composite"]))), evidence
 
     def _evaluate_institutional(self, df, side):
         try:
@@ -6398,21 +6473,32 @@ class ExecutionQueue:
         return None
 
     def _build_liquidity_pools(self, df):
+        """Swing liquidity pools with bar index preserved for recency checks."""
         if len(df) < 10:
             return {"high_pools": [], "low_pools": []}
         highs = df['high'].values
         lows = df['low'].values
-        sh = [highs[i] for i in range(2, len(df)-2) if highs[i] == max(highs[i-2:i+3])]
-        sl = [lows[i] for i in range(2, len(df)-2) if lows[i] == min(lows[i-2:i+3])]
+        sh = [(i, highs[i]) for i in range(2, len(df)-2) if highs[i] == max(highs[i-2:i+3])]
+        sl = [(i, lows[i]) for i in range(2, len(df)-2) if lows[i] == min(lows[i-2:i+3])]
         return {"high_pools": sh[-3:], "low_pools": sl[-3:]}
 
     def _detect_sweep(self, df, pools):
-        if len(df) < 2:
+        """Find the most recent sweep of any pool (scan whole series, return bar age)."""
+        n = len(df)
+        if n < 2:
             return False, False
-        last, prev = df.iloc[-1], df.iloc[-2]
-        swept_high = any(last['high'] > h and prev['high'] <= h for h in pools['high_pools'])
-        swept_low = any(last['low'] < l and prev['low'] >= l for l in pools['low_pools'])
-        return swept_high, swept_low
+        opt = []
+        for key in ("high_pools", "low_pools"):
+            for idx, level in pools.get(key, []):
+                for j in range(1, n):
+                    if key == "high_pools" and df['high'].iloc[j] > level and df['high'].iloc[j - 1] <= level:
+                        opt.append((n - 1 - j, "high"))
+                    elif key == "low_pools" and df['low'].iloc[j] < level and df['low'].iloc[j - 1] >= level:
+                        opt.append((n - 1 - j, "low"))
+        if not opt:
+            return None, None
+        age, kind = min(opt, key=lambda t: t[0])
+        return (age if kind == "high" else None), (age if kind == "low" else None)
 
     def _detect_stop_hunt(self, df):
         pools = self._build_liquidity_pools(df)
