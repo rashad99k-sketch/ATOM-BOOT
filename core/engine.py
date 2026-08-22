@@ -5792,14 +5792,16 @@ class ZoneMetrics:
     @property
     def final_zone_score(self) -> float:
         weights = {
-            'order_block_quality': 0.20,
+            # Re-weighted to favor causal evidence (structure/liquidity)
+            # and reduce the single-dimension OB veto. Sum remains 1.0.
+            'order_block_quality': 0.12,
             'zone_strength': 0.18,
-            'liquidity_quality': 0.15,
+            'liquidity_quality': 0.18,
             'institutional_confidence': 0.15,
-            'structure_alignment': 0.12,
+            'structure_alignment': 0.15,
             'entry_timing': 0.10,
             'trend_alignment': 0.05,
-            'risk_score': 0.05
+            'risk_score': 0.07
         }
         score = 0.0
         for attr, w in weights.items():
@@ -6432,21 +6434,17 @@ class ExecutionQueue:
         score = cand.zone_metrics.final_zone_score
         trigger = cand.zone_metrics.trigger_state
 
-        # FIX: require confirmation_count >= 2
+        # Confirmation persistence remains: two consecutive confirmed polls
+        # prove a structural event is persistent, not a 5-second transient.
+        # The four independent sub-gates (OB/Liquidity/Institutional/Structure)
+        # are removed: they are already weighted in the composite score and
+        # acted as duplicate gates on the same evidence.
         if cand.confirmation_count >= 2:
-            institutional_gate = (
-                cand.zone_metrics.order_block_quality >= 65 and
-                cand.zone_metrics.liquidity_quality >= 60 and
-                cand.zone_metrics.institutional_confidence >= 60 and
-                cand.zone_metrics.structure_alignment >= 65
-            )
             trigger_gate = trigger in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
-            if score >= 85 and trigger_gate and institutional_gate:
+            if score >= 75 and trigger_gate:
                 cand.state = ExecutionState.READY
-            elif score >= 70 and trigger == "MITIGATION" and institutional_gate:
+            elif score >= 70 and trigger == "MITIGATION":
                 cand.state = ExecutionState.ENTRY_VALIDATION
-            elif score >= 70:
-                cand.state = ExecutionState.WAITING_TRIGGER
             elif score >= 55:
                 cand.state = ExecutionState.GOOD_ZONE
             else:

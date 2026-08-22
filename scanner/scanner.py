@@ -1055,7 +1055,6 @@ def promote_to_queue():
 
     min_score = float(os.getenv("WATCHLIST_QUEUE_MIN_SCORE", "8.0"))
     min_narrative = float(os.getenv("WATCHLIST_QUEUE_MIN_NARRATIVE", "4.0"))
-    news_block = float(os.getenv("NEWS_RISK_BLOCK", "80"))
 
     watchlist = MEMORY.get("watchlist", {})
     if not isinstance(watchlist, dict):
@@ -1069,15 +1068,14 @@ def promote_to_queue():
             continue
         if item.get("state") in {"NEWS_RISK", "EXPIRED", "INVALIDATED", "ERROR", "DATA_DEGRADED"}:
             continue
-        if float(item.get("news_risk", 0)) >= news_block:
-            continue
 
         score = float(item.get("score", 0))
         narrative_score = float(item.get("narrative_score", 0))
         reasons = set(item.get("reasons") or [])
 
-        # Require actual structure/zone evidence. A raw radar score is not
-        # sufficient to enter the institutional queue.
+        # News is no longer a qualification gate here — it remains a final
+        # execution-context check inside _execute_ready_queue_candidate.
+        # Structural evidence remains mandatory for qualification.
         structural_evidence = bool(
             {"Liquidity Sweep", "BOS/CHoCH", "OB/Zone Retest",
              "Rejection", "Displacement"} & reasons

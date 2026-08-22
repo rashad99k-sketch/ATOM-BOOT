@@ -98,16 +98,21 @@ class InstitutionalQueueHardeningTest(unittest.TestCase):
         )
         cand.confirmation_count = 2
         cand.zone_metrics = self.engine.ZoneMetrics(
-            order_block_quality=90, zone_strength=90, liquidity_quality=80,
-            institutional_confidence=50, structure_alignment=90,
+            order_block_quality=50, zone_strength=50, liquidity_quality=50,
+            institutional_confidence=50, structure_alignment=50,
             entry_timing=90, trend_alignment=90, risk_score=90,
-            trigger_state="MSS_CONFIRMED",
-        )
+            trigger_state="MSS_CONFIRMED")
         cand.priority_score = cand.zone_metrics.final_zone_score
         queue._update_state(cand, 100)
         self.assertNotEqual(cand.state, self.engine.ExecutionState.READY)
 
-        cand.zone_metrics.institutional_confidence = 75
+        # when the composite reaches ≥75 with a confirmed trigger, READY fires
+        cand.zone_metrics = self.engine.ZoneMetrics(
+            order_block_quality=90, zone_strength=90, liquidity_quality=80,
+            institutional_confidence=85, structure_alignment=85,
+            entry_timing=90, trend_alignment=90, risk_score=90,
+            trigger_state="MSS_CONFIRMED")
+        cand.priority_score = cand.zone_metrics.final_zone_score
         queue._update_state(cand, 100)
         self.assertEqual(cand.state, self.engine.ExecutionState.READY)
 

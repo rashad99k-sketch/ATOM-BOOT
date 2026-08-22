@@ -238,7 +238,8 @@ def _execute_ready_queue_candidate():
 
     try:
         best = queue.get_best_candidate()
-        if best is None or best.priority_score < float(os.getenv("QUEUE_MIN_READY_SCORE", "80")):
+        # Unified with zone_score threshold: READY and EXECUTION both at 75.
+        if best is None or best.priority_score < float(os.getenv("QUEUE_MIN_READY_SCORE", "75")):
             return False
 
         # News is a risk gate even after queue promotion; the candidate remains
