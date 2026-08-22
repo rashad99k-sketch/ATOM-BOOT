@@ -242,8 +242,9 @@ def _execute_ready_queue_candidate():
         if best is None or best.priority_score < float(os.getenv("QUEUE_MIN_READY_SCORE", "75")):
             return False
 
-        # News is a risk gate even after queue promotion; the candidate remains
-        # visible until it either clears or is invalidated by queue re-evaluation.
+        # News is contextual evidence/catalyst and execution-risk input; it must
+        # not independently qualify or create an entry. Technical and
+        # institutional confirmation remain the primary decision authority.
         news_risk = 0.0
         watch = MEMORY.get("watchlist", {}).get(best.symbol, {})
         if isinstance(watch, dict):

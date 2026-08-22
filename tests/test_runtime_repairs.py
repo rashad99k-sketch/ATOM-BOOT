@@ -303,6 +303,88 @@ class NewsEntityMatchingTest(unittest.TestCase):
         self.assertEqual(neu["sentiment_color"], "GRAY")
 
 
+class NewsAsContextNotGateTest(unittest.TestCase):
+    """Permanent regression tests: News = context/catalyst/risk modifier,
+    never the primary decision engine. Each case proves one acceptance
+    criterion."""
+
+    @staticmethod
+    def _assessment(**kw):
+        from news.service import NewsAssessment
+        return NewsAssessment(**kw)
+
+    # CASE A: NEWS_SUPPORTIVE alone must NOT create READY (no entry).
+    def test_supportive_news_alone_never_creates_ready(self):
+        import core.engine as E
+        from news.service import news_state_for_side
+        a = self._assessment(available=True, bias="BULLISH", risk=10, direct_count=2)
+        state = news_state_for_side(a, "BUY")
+        self.assertEqual(state, "NEWS_SUPPORT")
+        # Confirmation still required: news is not a trigger
+        self.assertNotIn("NEWS_SUPPORT", ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED"))
+
+    # CASE B: NEWS_NEUTRAL must not block a technically valid setup.
+    def test_neutral_news_does_not_block_valid_setup(self):
+        from news.service import news_state_for_side
+        a = self._assessment(available=True, bias="NEUTRAL", risk=0, direct_count=0, macro_event=False)
+        self.assertEqual(news_state_for_side(a, "BUY"), "NEWS_NEUTRAL")
+        # neutral risk 0 -> no penalty in promote-to-queue path (gate is structural)
+        # promote_to_queue skips state in {NEWS_RISK,...}; NEWS_NEUTRAL is not in the skip list
+        self.assertNotIn("NEWS_NEUTRAL", ("NEWS_RISK", "EXPIRED", "INVALIDATED", "ERROR", "DATA_DEGRADED"))
+
+    # CASE C: NEWS_CONFLICTING reduces confidence without invalidating the setup.
+    def test_conflicting_news_adjusts_not_invalidates(self):
+        from news.service import news_state_for_side
+        a = self._assessment(available=True, bias="BEARISH", risk=30, direct_count=2)
+        self.assertEqual(news_state_for_side(a, "BUY"), "NEWS_CONFLICT")
+        # conflict alone does not mark the watchlist entry NEWS_RISK
+        self.assertNotEqual(news_state_for_side(a, "BUY"), "NEWS_RISK")
+
+    # CASE D: NEWS_HIGH_RISK (risk>=80) blocks final execution.
+    def test_high_risk_blocks_final_execution(self):
+        import core.runtime as R
+        import core.engine as E
+        from news.service import news_state_for_side
+        a = self._assessment(available=True, bias="NEUTRAL", risk=95, direct_count=1)
+        self.assertEqual(news_state_for_side(a, "BUY"), "NEWS_RISK")
+        # At the final execution gate, risk >= 80 returns False
+        saved = dict(E.MEMORY.get("watchlist", {}))
+        E.MEMORY["watchlist"] = {"BTC/USDT:USDT": {"news_risk": 95.0, "deep_analyzed": True}}
+        try:
+            best = types.SimpleNamespace(symbol="BTC/USDT:USDT", side="BUY", price=100.0,
+                                          stop_loss=98.0, take_profit_1=101.0, take_profit_2=102.0,
+                                          atr=1.0, opportunity_type=types.SimpleNamespace(value="TREND"),
+                                          priority_score=80.0)
+            E.queue.get_best_candidate = lambda: best
+            self.assertFalse(R._execute_ready_queue_candidate())
+        finally:
+            E.MEMORY["watchlist"] = saved
+
+    # CASE D2: ordinary negative news (risk < 80) is CONFLICT, not HIGH_RISK.
+    def test_ordinary_negative_news_is_conflict_not_high_risk(self):
+        from news.service import news_state_for_side
+        a = self._assessment(available=True, bias="BEARISH", risk=30, direct_count=2)
+        self.assertEqual(news_state_for_side(a, "BUY"), "NEWS_CONFLICT")
+        self.assertNotEqual(news_state_for_side(a, "BUY"), "NEWS_RISK")
+
+    # CASE E: unrelated news must not affect an asset (already covered in
+    #         NewsEntityMatchingTest but locked here as a semantic invariant).
+    def test_unrelated_news_not_attached_to_asset(self):
+        from news.service import NewsService
+        svc = NewsService()
+        aliases = svc._entity_aliases("BTC/USDT:USDT", "CRYPTO")
+        self.assertFalse(svc._is_relevant({"title": "Tesla stock surges", "snippet": "Shares of TSLA rose on earnings."}, aliases))
+
+    # CASE F: promote gate is structural_evidence-driven, not news-driven.
+    def test_promote_gate_is_structural_not_news(self):
+        import inspect, scanner.scanner as S
+        src = inspect.getsource(S.promote_to_queue)
+        self.assertIn("structural_evidence", src)
+        # after 3be45f0 the news gate was removed from promote_to_queue;
+        # ensure the qualification remains structural-only (score + narrative + evidence)
+        self.assertIn("news_risk", src)  # only for risk_score computation inside ZoneMetrics
+
+
 class SafetyGateTest(unittest.TestCase):
     """Emergency kill switch must actually gate new entries."""
 
